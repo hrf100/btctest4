@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Polymarket BTC 5分钟涨跌盘 —— 场次预判 + 数据采集 (阶段1)
+BTCtest4 —— Polymarket BTC 5分钟涨跌盘：场次预判 + 数据采集 (阶段1)
 
 数据源:
   - Chainlink BTC/USD : Polymarket RTDS websocket (crypto_prices_chainlink, 无需key)
@@ -14,7 +14,7 @@ Polymarket BTC 5分钟涨跌盘 —— 场次预判 + 数据采集 (阶段1)
   场中每隔60s记录一次 Polymarket 买卖价 (为阶段2"低价入场"研究积累数据)
 
 服务器一行启动:
-  curl -fsSL https://raw.githubusercontent.com/hrf100/btc5m/main/run.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/hrf100/btctest4/main/run.sh | bash
 """
 import asyncio, json, time, math, csv, os, logging
 from collections import deque

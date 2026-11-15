@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # 长久运行服务：一行安装/更新并启动
-#   curl -fsSL https://raw.githubusercontent.com/hrf100/btc5m/main/test4/run.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/hrf100/btctest4/main/test4/run.sh | bash
 # 启动或更新前会检查并关闭已有进程/服务，再拉代码重启。
 # 私钥放在 ~/.btc5m-4.env 的 POLY_PRIVATE_KEY。
 set -euo pipefail
 
-REPO="https://github.com/hrf100/btc5m.git"
+REPO="https://github.com/hrf100/btctest4.git"
 ROOT="${BTC5M4_DIR:-$HOME/btc5m-4}"
 PORT="${BTC5M4_PORT:-9999}"
 BIND="${BTC5M4_BIND:-0.0.0.0}"
@@ -129,7 +129,7 @@ install_systemd() {
   tmp="$(mktemp)"
   cat > "$tmp" <<EOF
 [Unit]
-Description=btc5m-4 Polymarket BTC 5m dashboard
+Description=BTCtest4 Polymarket BTC 5m dashboard
 After=network-online.target
 Wants=network-online.target
 

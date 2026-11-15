@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-btc5m v2 —— Polymarket BTC 5分钟涨跌盘: 场次预判 + 场中公允概率 + 数据采集 + Web看板(9999)
+BTCtest4 —— Polymarket BTC 5分钟涨跌盘: 场次预判 + 场中公允概率 + 数据采集 + Web看板(9999)
 
 结算规则(2026-08-14起): Chainlink BTC/USD 60秒TWAP
     Price to beat P0 = 开盘时刻 TWAP60 = 开盘前60秒均价
@@ -13,7 +13,7 @@ btc5m v2 —— Polymarket BTC 5分钟涨跌盘: 场次预判 + 场中公允概�
     POLY_API_KEY / POLY_API_SECRET / POLY_API_PASSPHRASE  已经有凭据时直接用
     DASH_TOKEN  可选，设置后访问看板需带 ?token=xxx
 服务器一行安装/更新（长久 systemd 服务；已在跑会先停再启）:
-  curl -fsSL https://raw.githubusercontent.com/hrf100/btc5m/main/test4/run.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/hrf100/btctest4/main/test4/run.sh | bash
 """
 import asyncio, json, time, math, csv, os, logging, argparse
 from bisect import bisect_left, bisect_right
@@ -1205,7 +1205,7 @@ async def index(req):
 
 
 HTML = r'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BTC 5分钟涨跌盘 监控</title><style>
+<title>BTCtest4 · 监控</title><style>
 body{background:#0e1116;color:#d6dbe3;font:13px/1.6 -apple-system,"PingFang SC","Microsoft YaHei","Noto Sans CJK SC",ui-monospace,Menlo,Consolas,monospace;margin:12px}
 h2{margin:0 0 8px;font-size:16px;color:#e6edf3}h3{margin:16px 0 6px;color:#8aa;font-size:13px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}
@@ -1239,7 +1239,7 @@ table{border-collapse:collapse;width:100%}td,th{padding:3px 6px;border-bottom:1p
 .meter .sub{font-size:10px;color:#7d8590;line-height:1.15}
 #feeds{margin-bottom:2px}
 #netline{color:#7d8590;font-size:12px;margin:0 0 6px;font-variant-numeric:tabular-nums}</style></head><body>
-<div class="topline"><h2>BTC 5分钟涨跌盘 · 实时监控</h2><div id="host" class="host-meters"></div></div>
+<div class="topline"><h2>BTCtest4 · 实时监控</h2><div id="host" class="host-meters"></div></div>
 <div id="netline"></div>
 <div id="feeds"></div>
 <h3>当前场次</h3><div id="top" class="grid"></div>
