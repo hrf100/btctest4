@@ -1268,6 +1268,26 @@ async def api_clear_rounds(req):
     return web.json_response({"ok": True, "cleared": n, "archived": archived})
 
 
+async def api_paper_clear(req):
+    """清空模拟成交记录；CSV 先归档为 .cleared.*.bak，不直接删。"""
+    if not _auth(req):
+        return web.Response(status=401, text="bad token")
+    n = len(S.paper)
+    S.paper = []
+    _reset_paper_stats()
+    path = PAPER_CSV
+    archived = None
+    if os.path.exists(path):
+        archived = f"{path}.cleared.{int(time.time())}.bak"
+        os.rename(path, archived)
+    _csv_fields.pop(path, None)
+    for w in S.win.values():
+        w["paper_filled"] = False
+        w.pop("paper_trade", None)
+    log.info("已清空模拟成交 %d 笔%s", n, f"，归档 {archived}" if archived else "")
+    return web.json_response({"ok": True, "cleared": n, "archived": archived})
+
+
 async def api_paper_cfg(req):
     """读取/保存模拟下单参数。每档: enabled / buy_price / max_tau / amount。"""
     if not _auth(req):
@@ -1499,8 +1519,19 @@ $('paperPager').innerHTML=`<button ${pg<=1?'disabled':''} onclick="gotoPaper(1)"
 <button ${pg<=1?'disabled':''} onclick="gotoPaper(${pg-1})">上一页</button>${nums}
 <button ${pg>=tp?'disabled':''} onclick="gotoPaper(${pg+1})">下一页</button>
 <button ${pg>=tp?'disabled':''} onclick="gotoPaper(${tp})">末页</button>
-<span class="info">第 ${pg}/${tp} 页，每页 ${pp.size||PAPER_PAGE_SIZE} 笔，共 ${pp.total||0} 笔</span>`}
+<span class="info">第 ${pg}/${tp} 页，每页 ${pp.size||PAPER_PAGE_SIZE} 笔，共 ${pp.total||0} 笔</span>
+<button class="danger" onclick="clearPaper()">清空</button>`}
 function gotoPaper(p){paperPage=Math.max(1,p||1);tick()}
+async function clearPaper(){
+if(!confirm('确定清空模拟成交记录？\n统计会归零，paper_trades.csv 会归档为 .cleared 备份。\n下单参数配置不受影响。')) return;
+try{
+const r=await fetch('/api/paper/clear'+Q,{method:'POST'});
+if(!r.ok){alert(r.status==401?'口令错误':'清空失败 HTTP '+r.status);return}
+const j=await r.json();
+paperPage=1;
+alert('已清空 '+j.cleared+' 笔'+(j.archived?'\n已归档: '+j.archived:''));
+tick();
+}catch(e){alert('清空失败: '+e)}}
 async function savePaper(){
 const body={};
 [['strong'],['weak']].forEach(([p])=>{body[p]={enabled:$('en_'+p).checked,buy_price:Number($('bp_'+p).value),amount:Number($('am_'+p).value),max_tau:Number($('mt_'+p).value)}});
@@ -1524,7 +1555,8 @@ async def main(host, port):
         app.add_routes([web.get("/", index), web.get("/api/state", api_state),
                         web.post("/api/rounds/clear", api_clear_rounds),
                         web.get("/api/paper/cfg", api_paper_cfg),
-                        web.post("/api/paper/cfg", api_paper_cfg)])
+                        web.post("/api/paper/cfg", api_paper_cfg),
+                        web.post("/api/paper/clear", api_paper_clear)])
         runner = web.AppRunner(app, access_log=None)
         await runner.setup()
         await web.TCPSite(runner, host, port).start()
