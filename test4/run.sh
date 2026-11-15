@@ -67,12 +67,24 @@ stop_existing() {
 stop_existing
 
 # ---------- 2. 拉取/更新代码 ----------
+# 已有目录可能仍指向旧仓库(btc5m)，必须先改 origin 再拉，否则标题/代码不会更新
 if [ ! -f "$ROOT/test4/btc5m-4.py" ]; then
   say "克隆仓库到 $ROOT"
   git clone "$REPO" "$ROOT"
 elif [ -d "$ROOT/.git" ]; then
-  say "更新代码"
-  git -C "$ROOT" pull --ff-only
+  say "同步仓库 $REPO"
+  git -C "$ROOT" remote set-url origin "$REPO"
+  git -C "$ROOT" fetch origin
+  branch="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
+  if [ "$branch" = "HEAD" ]; then branch=main; fi
+  if ! git -C "$ROOT" pull --ff-only origin "$branch"; then
+    warn "快进失败，强制对齐 origin/$branch（data/ 不受影响）"
+    git -C "$ROOT" checkout -B "$branch" "origin/$branch"
+    git -C "$ROOT" reset --hard "origin/$branch"
+  fi
+  say "当前提交: $(git -C "$ROOT" rev-parse --short HEAD) $(git -C "$ROOT" log -1 --pretty=%s)"
+else
+  warn "$ROOT 无 .git，无法自动更新；请删目录后重装或手动改 remote"
 fi
 
 # curl 管道里跑的是旧脚本；拉完后改跑仓库里的最新 run.sh
