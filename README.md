@@ -1,4 +1,4 @@
-# BTCtest4
+# BTC-test4
 
 Polymarket BTC 5 分钟涨跌盘：下场预判、场中公允概率、数据采集与 Web 看板。
 

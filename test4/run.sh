@@ -129,7 +129,7 @@ install_systemd() {
   tmp="$(mktemp)"
   cat > "$tmp" <<EOF
 [Unit]
-Description=BTCtest4 Polymarket BTC 5m dashboard
+Description=BTC-test4 Polymarket BTC 5m dashboard
 After=network-online.target
 Wants=network-online.target
 

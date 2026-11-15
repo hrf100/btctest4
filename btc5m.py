@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BTCtest4 —— Polymarket BTC 5分钟涨跌盘：场次预判 + 数据采集 (阶段1)
+BTC-test4 —— Polymarket BTC 5分钟涨跌盘：场次预判 + 数据采集 (阶段1)
 
 数据源:
   - Chainlink BTC/USD : Polymarket RTDS websocket (crypto_prices_chainlink, 无需key)
