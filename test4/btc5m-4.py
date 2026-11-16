@@ -1671,6 +1671,13 @@ const PAGE_SIZE=20; let page=1; let roundsPage={rows:[],page:1,pages:1,total:0,s
 const setH=(id,h)=>{const e=$(id);if(e&&e._h!==h){e._h=h;e.innerHTML=h}};
 const PAPER_PAGE_SIZE=20; let paperPage=1;
 const SIGT={pre:'前',strong:'强',weak:'普'}, SIGN={pre:'开盘前买入',strong:'强信号·开盘后',weak:'普通信号·开盘后'}, SIGC={pre:'#f0883e',strong:'#58a6ff',weak:'#a371f7'};
+// 配置保存结果写在配置栏里，不用弹窗；4 秒后自动消失
+let paperHint='', paperHintC='#7d8590', paperHintTimer=null;
+function showHint(msg,col='#7d8590'){
+paperHint=msg; paperHintC=col;
+if(paperHintTimer) clearTimeout(paperHintTimer);
+paperHintTimer=setTimeout(()=>{paperHint='';const e=$('paperHint');if(e){e.textContent='';e.style.color='#7d8590'}},4000);
+const e=$('paperHint'); if(e){e.textContent=msg; e.style.color=col}}
 function plot(cv,lines,o={}){const dpr=devicePixelRatio||1,W=cv.clientWidth,H=cv.clientHeight;cv.width=W*dpr;cv.height=H*dpr;
 const g=cv.getContext('2d');g.scale(dpr,dpr);let xs=[],ys=[];lines.forEach(l=>l.d.forEach(p=>{if(p[1]!=null){xs.push(p[0]);ys.push(p[1])}}));
 (o.h||[]).forEach(h=>ys.push(h.y));if(!xs.length)return;
@@ -1687,8 +1694,8 @@ function renderRounds(){
 const tp=pages();
 if(page>tp) page=tp;
 const total=roundsPage.total||0, rows=(roundsPage.rows||[]);
-let t='<table><tr><th>场次(UTC)</th><th>预判</th><th>预判概率</th><th>结果</th><th>命中</th><th>结果来源</th><th>开盘基准(自算)</th><th>收盘均价(自算)</th><th>开盘基准(官方)</th><th>收盘均价(官方)</th><th>预判时卖价 涨/跌</th></tr>';
-rows.forEach(r=>{t+=`<tr><td>${r.time_utc}</td><td>${ud(r.pred)}</td><td>${f(r.p_pred,3)}</td><td>${ud(r.outcome)}</td><td class="${r.hit?'up':'dn'}">${r.hit?'✔ 中':'✘ 错'}</td><td>${LAB[r.label]||r.label}</td><td>${f(r.p0_calc)}</td><td>${f(r.c_calc)}</td><td>${f(r.p0_tw)}</td><td>${f(r.c_tw)}</td><td>${f(r.up_ask0,2)} / ${f(r.dn_ask0,2)}</td></tr>`});
+let t='<table><tr><th>场次(UTC)</th><th>预判</th><th>预判概率</th><th>结果</th><th>命中</th><th>预判时卖价 涨/跌</th><th>结果来源</th><th>开盘基准(自算)</th><th>收盘均价(自算)</th><th>开盘基准(官方)</th><th>收盘均价(官方)</th></tr>';
+rows.forEach(r=>{t+=`<tr><td>${r.time_utc}</td><td>${ud(r.pred)}</td><td>${f(r.p_pred,3)}</td><td>${ud(r.outcome)}</td><td class="${r.hit?'up':'dn'}">${r.hit?'✔ 中':'✘ 错'}</td><td>${f(r.up_ask0,2)} / ${f(r.dn_ask0,2)}</td><td>${LAB[r.label]||r.label}</td><td>${f(r.p0_calc)}</td><td>${f(r.c_calc)}</td><td>${f(r.p0_tw)}</td><td>${f(r.c_tw)}</td></tr>`});
 setH('tbl',t+'</table>');
 let nums=''; const from=Math.max(1,page-2), to=Math.min(tp, page+2);
 for(let i=from;i<=to;i++) nums+=`<button class="${i===page?'on':''}" onclick="gotoPage(${i})">${i}</button>`;
@@ -1779,7 +1786,8 @@ b+=`<span class="pg" style="display:flex;gap:8px;flex-wrap:wrap;align-items:cent
 <label>金额(U) <input type="number" id="am_${p}" min="0.1" max="10000" step="0.1" value="${c.amount??5}"></label>`
 +(p=='pre'?'':`<label>窗口(秒) <input type="number" id="mt_${p}" min="5" max="300" step="1" value="${c.max_tau??150}"></label>`)+`</span>`});
 b+=`<button onclick="savePaper()">保存</button><span class="mut" id="paperHint"></span>`;
-$('paperBar').innerHTML=b}
+$('paperBar').innerHTML=b;
+const he=$('paperHint'); if(he&&paperHint){he.textContent=paperHint;he.style.color=paperHintC}}
 const ps=d.paper_stats||{};
 const pct=x=>x==null?'-':(x*100).toFixed(1)+'%';
 const sg=p=>{const s=(ps.by_sig||{})[p]||{};return `${SIGT[p]} ${s.trades||0}笔/${s.settled||0}结算 胜率 ${pct(s.win_rate)} 盈亏 ${s.pnl==null?'-':((s.pnl>=0?'+':'')+Number(s.pnl).toFixed(3))}U`};
@@ -1820,9 +1828,9 @@ if($('ms_'+p))o.min_strength=Number($('ms_'+p).value);
 body[p]=o});
 try{const r=await fetch('/api/paper/cfg'+Q,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
 const j=await r.json();
-if(!r.ok||!j.ok){alert(j.error||('保存失败 '+r.status));return}
-alert('已保存');tick()}
-catch(e){alert('保存失败: '+e)}}
+if(!r.ok||!j.ok){showHint(j.error||('保存失败 '+r.status),'#f85149');return}
+showHint('已保存','#3fb950');tick()}
+catch(e){showHint('保存失败: '+e,'#f85149')}}
 async function tick(){try{const sep=Q?Q+'&':'?';const r=await fetch('/api/state'+Q+sep+'ppage='+paperPage+'&psize='+PAPER_PAGE_SIZE+'&rpage='+page+'&rsize='+PAGE_SIZE);if(!r.ok){$('feeds').textContent=r.status==401?'访问口令错误：请在网址后加 ?token=你的口令（在服务器执行 btc5m url 查看）':'请求失败 HTTP '+r.status;return}draw(await r.json())}catch(e){$('feeds').textContent='无法连接服务器，稍后自动重试…'}}
 tick();setInterval(tick,1000);
 </script></body></html>'''
