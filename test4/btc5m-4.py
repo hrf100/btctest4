@@ -15,7 +15,7 @@ BTC-test4 —— Polymarket BTC 5分钟涨跌盘: 场次预判 + 场中公允概
 服务器一行安装/更新（长久 systemd 服务；已在跑会先停再启）:
   curl -fsSL https://raw.githubusercontent.com/hrf100/btctest4/main/test4/run.sh | bash
 """
-import asyncio, json, time, math, csv, os, logging, argparse, io, zipfile
+import asyncio, json, time, math, csv, os, logging, argparse, io, zipfile, itertools
 from bisect import bisect_left, bisect_right
 from collections import deque
 import aiohttp
@@ -79,10 +79,39 @@ class Series:
         return self.p[-1] if self.p else None
 
 
+class Flow:
+    """最近 sec 秒的主动成交: 边追加边维护累计和, 避免每次都重扫几万条。
+
+    成交流量到 100 笔/秒时, 原来保留 180 秒要扫 1.8 万条, features() 每次 1.2ms;
+    现在只留 sec 秒并增量维护, 每次约 0.01ms。
+    """
+
+    def __init__(self, sec=60):
+        self.sec, self.dq, self.s, self.a = sec, deque(), 0.0, 0.0
+
+    def add(self, ts, q):
+        self.dq.append((ts, q))
+        self.s += q
+        self.a += abs(q)
+        self._trim(ts)
+
+    def _trim(self, now):
+        # 只留最近 sec 秒, 这样 s/a 就是精确的窗口累计
+        lim = now - self.sec
+        while self.dq and self.dq[0][0] < lim:
+            _, q = self.dq.popleft()
+            self.s -= q
+            self.a -= abs(q)
+
+    def ratio(self, now):
+        self._trim(now)
+        return (self.s / self.a) if self.a > 0 else 0.0
+
+
 class St:
     def __init__(self):
         self.cl, self.tw, self.bn, self.okx = Series(), Series(), Series(), Series()
-        self.flow = {"bn": deque(), "okx": deque()}
+        self.flow = {"bn": Flow(), "okx": Flow()}
         self.obi = {"bn": 0.0, "okx": 0.0}
         self.last_msg = {k: 0 for k in ("cl", "tw", "bn", "okx", "pm")}
         self.cl_src = ""
@@ -90,6 +119,8 @@ class St:
         self.pm, self.tokens, self.pm_ws = {}, set(), None
         self.win, self.rounds = {}, deque(maxlen=ROUNDS_KEEP)
         self.view, self.sigma = {}, DEFAULT_SIGMA
+        self.sigma_t = 0.0         # 上次重估波动率的时间
+        self.ticks_t = 0.0         # 上次写 ticks.csv 的时间
         self.conn_t = 0.0          # 最近一次PolyBolt连接时间
         self.cl_nofilter = False   # 看门狗触发后切换: 不带symbol过滤订阅, 本地过滤btcusd
         self.paper_cfg = {k: dict(v) for k, v in PAPER_DEFAULT.items()}
@@ -101,9 +132,45 @@ class St:
         self.started = time.time()       # 本次进程启动时间
         # 全量历史统计(不受 ROUNDS_KEEP 截断); 命中率以 CSV 全量为准
         self.round_n = self.round_hits = self.round_cn = self.round_chits = 0
+        # 各 WS 消息量与解析耗时累计(用于定位 CPU)
+        self.msg = {"poly": 0, "bn": 0, "okx": 0}
+        self.msg_cost = {"poly": 0.0, "bn": 0.0, "okx": 0.0}
 
 
 S = St()
+
+
+# ------------------------------------------------------------------ 轻量耗时统计
+# 只在关键循环里加 process_time 差值, 开销可忽略; 用于定位 CPU 花在哪
+PERF = {}
+_perf_snap = {"t": 0.0}
+
+
+def _perf(name, t0):
+    d = PERF.get(name)
+    if d is None:
+        PERF[name] = [time.process_time() - t0, 1]
+    else:
+        d[0] += time.process_time() - t0
+        d[1] += 1
+
+
+def perf_share():
+    """各任务实际消耗的 CPU：ms/s（= 单核占用百分比）与每秒次数。"""
+    now = time.time()
+    dt = now - (_perf_snap["t"] or now)
+    prev_t = _perf_snap.get("cpu", {})
+    prev_n = _perf_snap.get("n", {})
+    cur_t = {k: v[0] for k, v in PERF.items()}
+    cur_n = {k: v[1] for k, v in PERF.items()}
+    out = {}
+    if dt > 0:
+        for k in cur_t:
+            d = max(0.0, cur_t[k] - prev_t.get(k, 0.0))
+            out[k] = {"ms_per_s": round(1000 * d / dt, 2),
+                      "per_s": round((cur_n[k] - prev_n.get(k, 0)) / dt, 1)}
+    _perf_snap.update(t=now, cpu=cur_t, n=cur_n)
+    return out
 
 
 def _paper_check(prof, c):
@@ -250,6 +317,21 @@ def paper_page(page=1, size=20):
     end = total - (page - 1) * size
     chunk = rows[max(0, start):max(0, end)]
     return {"page": page, "size": size, "pages": pages, "total": total, "rows": chunk}
+
+
+def round_page(page=1, size=20):
+    """历史场次分页（最新在前）。只传当前页，避免每秒把几千场全量塞给浏览器。"""
+    rows = S.rounds
+    total = len(rows)
+    size = max(1, min(int(size or 20), 200))
+    pages = max(1, math.ceil(total / size))
+    page = max(1, min(int(page or 1), pages))
+    if total == 0:
+        return {"page": 1, "size": size, "pages": 1, "total": 0, "rows": []}
+    end = total - (page - 1) * size
+    start = max(0, end - size)
+    return {"page": page, "size": size, "pages": pages, "total": total,
+            "rows": list(itertools.islice(rows, start, end))[::-1]}
 
 
 PAPER_FIELDS = ("start", "time_utc", "sig", "tau", "side", "buy_price", "amount", "shares",
@@ -628,6 +710,9 @@ def est_sigma(h, now, span=300):
 
 
 def flow_ratio(dq, now, sec=60):
+    """主动成交方向占比。dq 可以是 Flow 对象或旧式 deque。"""
+    if hasattr(dq, "ratio"):
+        return dq.ratio(now)
     while dq and dq[0][0] < now - 180:
         dq.popleft()
     xs = [q for ts, q in dq if ts >= now - sec]
@@ -727,6 +812,9 @@ def _crypto_points(pl):
     pts = pl["data"] if isinstance(pl.get("data"), list) else [pl]
     out = []
     for p in pts:
+        # 不带过滤订阅时一包里混着其它币种, 必须逐条筛掉, 否则会污染价格序列
+        if isinstance(p, dict) and p.get("symbol") not in (None, "btcusd"):
+            continue
         v = fl(p.get("full_accuracy_value", p.get("value")))
         if v is not None and "timestamp" in p:
             out.append((p["timestamp"] / 1000, v))
@@ -757,10 +845,20 @@ async def ws_poly(sess):
                 async for m in ws:
                     if m.type != aiohttp.WSMsgType.TEXT:
                         continue
+                    raw = m.data
+                    # 不带过滤订阅时全市场消息都会推过来; 子串预筛比 json.loads 便宜两个数量级。
+                    # 控制消息(op)必须放行, 否则认证/订阅回执会被丢掉。
+                    if (S.cl_nofilter and '"op"' not in raw and "btcusd" not in raw
+                            and "price.polymarket" not in raw):
+                        S.msg["drop"] = S.msg.get("drop", 0) + 1
+                        continue
+                    _t0 = time.process_time()
                     try:
-                        d = json.loads(m.data)
+                        d = json.loads(raw)
                     except Exception:
                         continue
+                    S.msg["poly"] += 1
+                    S.msg_cost["poly"] += time.process_time() - _t0
                     now = time.time()
                     op = d.get("op")
                     if op:
@@ -883,9 +981,10 @@ async def ws_binance(sess):
                         continue
                     d = json.loads(m.data).get("data", {})
                     now = time.time()
+                    S.msg["bn"] += 1
                     if d.get("e") == "aggTrade":
                         px, q = float(d["p"]), float(d["q"])
-                        S.flow["bn"].append((now, -q if d["m"] else q))
+                        S.flow["bn"].add(now, -q if d["m"] else q)
                         S.bn.add(now, px, gap=1.0)
                     elif "bids" in d:
                         b = sum(float(x[1]) for x in d["bids"])
@@ -917,11 +1016,14 @@ async def ws_okx(sess):
                             continue
                         d = json.loads(m.data)
                         ch = (d.get("arg") or {}).get("channel")
+                        if ch not in ("trades", "books5"):
+                            continue
+                        S.msg["okx"] += 1
                         now = time.time()
                         for it in d.get("data", []):
                             if ch == "trades":
                                 px, q = float(it["px"]), float(it["sz"])
-                                S.flow["okx"].append((now, q if it["side"] == "buy" else -q))
+                                S.flow["okx"].add(now, q if it["side"] == "buy" else -q)
                                 S.okx.add(now, px, gap=1.0)
                             elif ch == "books5":
                                 b = sum(float(x[1]) for x in it["bids"])
@@ -1144,6 +1246,7 @@ async def settle(sess, s):
 async def ticker(sess):
     while True:
         try:
+            _pt = time.process_time()
             now = time.time()
             s0 = int(now // WIN) * WIN
             for s in (s0, s0 + WIN):
@@ -1159,7 +1262,8 @@ async def ticker(sess):
             ref, rn = get_ref()
             if S.win[nxt]["pred_done"]:
                 try_paper_pre(nxt, now, S.win[nxt], ref.last())
-            if int(now) % 5 == 0:
+            if now - S.sigma_t >= 5:
+                S.sigma_t = now
                 sg = est_sigma_h(ref, now)
                 if sg:
                     S.sigma = 0.8 * S.sigma + 0.2 * sg
@@ -1185,7 +1289,8 @@ async def ticker(sess):
                         r["paper"] = cur["paper_trade"]
                     v["cur"] = r
                     cur["ticks"].append([round(now - s0, 1), round(r["p"], 4), ub, ua, db, da])
-                    if int(now) % 2 == 0:
+                    if now - S.ticks_t >= 2:
+                        S.ticks_t = now
                         ft = features(now)
                         append_csv(f"{DATA}/ticks.csv", {
                             "ts": round(now, 1), "start": s0, "tau": round(now - s0, 1), "ref": rn,
@@ -1198,6 +1303,7 @@ async def ticker(sess):
             nw = S.win[nxt]
             v["nxt"] = {"start": nxt, "pred": nw.get("pred"), "p": nw.get("p_pred"), "conf": nw.get("conf")}
             S.view = v
+            _perf("ticker", _pt)
         except Exception:
             log.exception("ticker")
         await asyncio.sleep(max(0.05, 1 - (time.time() % 1)))
@@ -1224,11 +1330,23 @@ async def status():
         age = {k: (f"{now - v:.0f}s" if v else "NEVER") for k, v in S.last_msg.items()}
         log.info("feeds %s | poly-auth=%s cl_src=%s | cl=%s tw=%s bn=%s okx=%s sigma=%.2f",
                  age, S.auth, S.cl_src, S.cl.last(), S.tw.last(), S.bn.last(), S.okx.last(), S.sigma)
+        perf = perf_share()
+        if perf:
+            log.info("cpu %s", " | ".join(f"{k} {v['ms_per_s']}ms/s({v['per_s']}/s)" for k, v in
+                                          sorted(perf.items(), key=lambda kv: -kv[1]["ms_per_s"])))
+        tot = S.msg["poly"] + S.msg["bn"] + S.msg["okx"]
+        if tot and now > S.started:
+            el = now - S.started
+            log.info("ws消息 poly=%d(%.1f/s,解析%.0fms) bn=%d(%.1f/s) okx=%d(%.1f/s)",
+                     S.msg["poly"], S.msg["poly"] / el, S.msg_cost["poly"] * 1000,
+                     S.msg["bn"], S.msg["bn"] / el, S.msg["okx"], S.msg["okx"] / el)
 
 
 # ------------------------------------------------------------------ Web 看板
 _cpu_sample = None
+_proc_sample = None
 _net_sample = None  # (ts, rx_bytes, tx_bytes)
+_host_cache = {"t": 0.0, "v": None}
 
 
 def _net_bytes():
@@ -1246,10 +1364,16 @@ def _net_bytes():
 
 
 def host_stats():
-    """读本机 CPU / 内存 / 网卡流量 (Linux /proc)。不额外装依赖。"""
+    """读本机 CPU / 内存 / 网卡流量 (Linux /proc)。不额外装依赖。
+    多开看板时同一秒内只读一次 /proc。"""
     global _cpu_sample, _net_sample
+    now_t = time.time()
+    if _host_cache["v"] is not None and now_t - _host_cache["t"] < 1.0:
+        out = dict(_host_cache["v"])
+        out["uptime_sec"] = max(0, int(now_t - S.started))
+        return out
     up = max(0, int(time.time() - S.started))
-    out = {"cpu": None, "mem_used_mb": None, "mem_total_mb": None, "proc_mb": None,
+    out = {"cpu": None, "proc_cpu": None, "mem_used_mb": None, "mem_total_mb": None, "proc_mb": None,
            "uptime_sec": up, "started": round(S.started, 1),
            "net_rx": None, "net_tx": None, "net_rx_bps": None, "net_tx_bps": None}
     try:
@@ -1261,6 +1385,19 @@ def host_stats():
         if _cpu_sample and now[0] > _cpu_sample[0]:
             out["cpu"] = round((1 - (now[1] - _cpu_sample[1]) / (now[0] - _cpu_sample[0])) * 100, 1)
         _cpu_sample = now
+    except Exception:
+        pass
+    try:
+        # 本进程 CPU: 只算本进程的 utime+stime, 与整机负载区分开
+        global _proc_sample
+        with open("/proc/self/stat") as fh:
+            sf = fh.read().rsplit(") ", 1)[1].split()
+        ticks = (int(sf[11]) + int(sf[12])) / os.sysconf("SC_CLK_TCK")
+        if _proc_sample and now_t > _proc_sample[0]:
+            dt = now_t - _proc_sample[0]
+            if dt > 0:
+                out["proc_cpu"] = round(100 * (ticks - _proc_sample[1]) / dt, 1)
+        _proc_sample = (now_t, ticks)
     except Exception:
         pass
     try:
@@ -1292,6 +1429,7 @@ def host_stats():
         _net_sample = (t, rx, tx)
     except Exception:
         pass
+    _host_cache["t"], _host_cache["v"] = now_t, out
     return out
 
 
@@ -1306,7 +1444,6 @@ async def api_state(req):
     ref, _ = get_ref()
     chart = [[t, ref.at(t), S.bn.at(t), S.okx.at(t), S.tw.at(t)] for t in range(int(now) - 420, int(now), 2)]
     cur = S.win.get(int(now // WIN) * WIN)
-    rounds = list(S.rounds)
     feeds = {k: (now - v if v else None) for k, v in S.last_msg.items()}
     try:
         ppage = int(req.query.get("ppage") or 1)
@@ -1316,8 +1453,16 @@ async def api_state(req):
         psize = int(req.query.get("psize") or 20)
     except Exception:
         psize = 20
+    try:
+        rpage = int(req.query.get("rpage") or 1)
+    except Exception:
+        rpage = 1
+    try:
+        rsize = int(req.query.get("rsize") or 20)
+    except Exception:
+        rsize = 20
     return web.json_response({**S.view, "chart": chart, "ticks": cur["ticks"] if cur else [],
-                              "rounds": rounds, "stats": round_stats(), "feeds": feeds,
+                              "rounds": round_page(rpage, rsize), "stats": round_stats(), "feeds": feeds,
                               "auth": S.auth, "cl_src": S.cl_src, "host": host_stats(),
                               "paper_cfg": S.paper_cfg, "paper": paper_page(ppage, psize),
                               "paper_stats": paper_stats()})
@@ -1521,7 +1666,9 @@ const AUTH=a=>a=='ok'?'已认证':a=='no-creds'?'未配置凭据':a=='deriving'?
 const card=(k,v,c='',tip='')=>`<div class="card" title="${tip}"><div class="k">${k}</div><div class="v ${c}">${v}</div></div>`;
 const hm=s=>new Date(s*1000).toISOString().slice(11,16)+' UTC';
 const age=a=>a==null?'<span class=dn>无数据</span>':(a<5?`<span class=up>${a.toFixed(1)}秒</span>`:`<span class=warn>${a.toFixed(0)}秒</span>`);
-const PAGE_SIZE=20; let page=1, roundsCache=[];
+const PAGE_SIZE=20; let page=1; let roundsPage={rows:[],page:1,pages:1,total:0,size:20};
+// 只在内容变化时写 DOM：每秒刷一次时，表格和分页条多数轮次其实是同一个 HTML
+const setH=(id,h)=>{const e=$(id);if(e&&e._h!==h){e._h=h;e.innerHTML=h}};
 const PAPER_PAGE_SIZE=20; let paperPage=1;
 const SIGT={pre:'前',strong:'强',weak:'普'}, SIGN={pre:'开盘前买入',strong:'强信号·开盘后',weak:'普通信号·开盘后'}, SIGC={pre:'#f0883e',strong:'#58a6ff',weak:'#a371f7'};
 function plot(cv,lines,o={}){const dpr=devicePixelRatio||1,W=cv.clientWidth,H=cv.clientHeight;cv.width=W*dpr;cv.height=H*dpr;
@@ -1534,24 +1681,24 @@ g.font='10px monospace';g.lineWidth=1;for(let i=0;i<=4;i++){const y=y0+(y1-y0)*i
 (o.h||[]).forEach(h=>{g.strokeStyle=h.c;g.setLineDash([4,3]);g.beginPath();g.moveTo(44,Y(h.y));g.lineTo(W-8,Y(h.y));g.stroke();g.setLineDash([])});
 lines.forEach(l=>{g.strokeStyle=l.c;g.lineWidth=1.5;g.beginPath();let on=false;l.d.forEach(p=>{if(p[1]==null){on=false;return}const x=X(p[0]),y=Y(p[1]);if(on)g.lineTo(x,y);else{g.moveTo(x,y);on=true}});g.stroke()});
 let lx=48;g.font='11px sans-serif';lines.forEach(l=>{g.fillStyle=l.c;const label=l.v==null?l.n:`${l.n} ${l.v}`;g.fillText(label,lx,9);lx+=g.measureText(label).width+18})}
-function pages(){return Math.max(1, Math.ceil(roundsCache.length / PAGE_SIZE))}
-function gotoPage(p){page=Math.min(Math.max(1,p), pages()); renderRounds()}
+function pages(){return Math.max(1, roundsPage.pages||1)}
+function gotoPage(p){page=Math.min(Math.max(1,p), pages()); tick()}
 function renderRounds(){
-const total=roundsCache.length, tp=pages();
+const tp=pages();
 if(page>tp) page=tp;
-const start=(page-1)*PAGE_SIZE, rows=roundsCache.slice(start, start+PAGE_SIZE);
+const total=roundsPage.total||0, rows=(roundsPage.rows||[]);
 let t='<table><tr><th>场次(UTC)</th><th>预判</th><th>预判概率</th><th>结果</th><th>命中</th><th>结果来源</th><th>开盘基准(自算)</th><th>收盘均价(自算)</th><th>开盘基准(官方)</th><th>收盘均价(官方)</th><th>预判时卖价 涨/跌</th></tr>';
 rows.forEach(r=>{t+=`<tr><td>${r.time_utc}</td><td>${ud(r.pred)}</td><td>${f(r.p_pred,3)}</td><td>${ud(r.outcome)}</td><td class="${r.hit?'up':'dn'}">${r.hit?'✔ 中':'✘ 错'}</td><td>${LAB[r.label]||r.label}</td><td>${f(r.p0_calc)}</td><td>${f(r.c_calc)}</td><td>${f(r.p0_tw)}</td><td>${f(r.c_tw)}</td><td>${f(r.up_ask0,2)} / ${f(r.dn_ask0,2)}</td></tr>`});
-$('tbl').innerHTML=t+'</table>';
+setH('tbl',t+'</table>');
 let nums=''; const from=Math.max(1,page-2), to=Math.min(tp, page+2);
 for(let i=from;i<=to;i++) nums+=`<button class="${i===page?'on':''}" onclick="gotoPage(${i})">${i}</button>`;
-$('pager').innerHTML=`<button ${page<=1?'disabled':''} onclick="gotoPage(1)">首页</button>
+setH('pager',`<button ${page<=1?'disabled':''} onclick="gotoPage(1)">首页</button>
 <button ${page<=1?'disabled':''} onclick="gotoPage(${page-1})">上一页</button>${nums}
 <button ${page>=tp?'disabled':''} onclick="gotoPage(${page+1})">下一页</button>
 <button ${page>=tp?'disabled':''} onclick="gotoPage(${tp})">末页</button>
-<span class="info">第 ${page}/${tp} 页，每页 ${PAGE_SIZE} 场，共 ${total} 场</span>
+<span class="info">第 ${page}/${tp} 页，每页 ${roundsPage.size||PAGE_SIZE} 场，共 ${total} 场</span>
 <button onclick="exportData()">导出数据包</button>
-<button class="danger" onclick="clearRounds()">清空重置</button>`}
+<button class="danger" onclick="clearRounds()">清空重置</button>`)}
 function exportData(){window.open('/api/data/export'+Q,'_blank')}
 async function clearRounds(){
 if(!confirm('确定清空历史场次？命中率会归零。\n当前 rounds_v2.csv 会归档为 .cleared 备份，不会直接删除。\nticks/outcomes 分析文件保留。')) return;
@@ -1559,7 +1706,7 @@ try{
 const r=await fetch('/api/rounds/clear'+Q,{method:'POST'});
 if(!r.ok){alert(r.status==401?'口令错误':'清空失败 HTTP '+r.status);return}
 const j=await r.json();
-page=1;roundsCache=[];renderRounds();
+page=1;roundsPage={rows:[],page:1,pages:1,total:0,size:PAGE_SIZE};renderRounds();
 alert('已清空 '+j.cleared+' 场'+(j.archived?'\n已归档: '+j.archived:''));
 tick();
 }catch(e){alert('清空失败: '+e)}}
@@ -1576,13 +1723,12 @@ return(i===0?Math.round(n):n.toFixed(n>=100?0:n>=10?1:2))+u[i]}
 function fmtRate(bps){return bps==null?'-':fmtBytes(bps)+'/s'}
 function drawHost(H){H=H||{};
 const cpu=H.cpu, memPct=(H.mem_used_mb!=null&&H.mem_total_mb)?(100*H.mem_used_mb/H.mem_total_mb):null;
-const procPct=(H.proc_mb!=null&&H.mem_total_mb)?(100*H.proc_mb/H.mem_total_mb):null;
 const cpuVal=cpu==null?'采样中…':`${Number(cpu).toFixed(1)}%`;
 const memVal=(H.mem_used_mb!=null&&H.mem_total_mb!=null)?`${H.mem_used_mb} / ${H.mem_total_mb} MB`:'-';
 const procVal=H.proc_mb==null?'-':`${H.proc_mb} MB`;
 const up=H.uptime_sec, upRing=up==null?0:Math.min(100,(up%(24*3600))/(24*3600)*100);
 const upSub=H.started?('启动 '+new Date(H.started*1000).toISOString().slice(5,16).replace('T',' ')+' UTC'):'本次进程';
-$('host').innerHTML=meter('已运行',upRing,up==null?'-':fmtUp(up),upSub)+meter('CPU',cpu,cpuVal,'整机占用')+meter('内存',memPct,memVal,'已用 / 总量')+meter('本进程',procPct,procVal,'RSS');
+$('host').innerHTML=meter('本进程 CPU',H.proc_cpu,`${H.proc_cpu==null?'--':H.proc_cpu.toFixed(1)+'%'}`,`RSS ${procVal}`)+meter('整机 CPU',cpu,cpuVal,'全部进程')+meter('内存',memPct,memVal,'已用 / 总量')+meter('已运行',upRing,up==null?'-':fmtUp(up),upSub);
 const hasNet=H.net_rx!=null||H.net_tx!=null;
 $('netline').innerHTML=hasNet?`流量 ↓${fmtRate(H.net_rx_bps)} ↑${fmtRate(H.net_tx_bps)}　累计 ↓${fmtBytes(H.net_rx)} ↑${fmtBytes(H.net_tx)}`:'';}
 function draw(d){const c=d.cur,F=d.feeds||{};
@@ -1600,20 +1746,24 @@ if(c){h+=card('本场剩余',Math.max(0,c.end-d.now).toFixed(0)+' 秒')
 +card('“跌” 买一 / 卖一',f(c.dn_bid,2)+' / '+f(c.dn_ask,2),'','Polymarket上“跌”份额的最高买价 / 最低卖价')
 +card('模型−卖价：涨 / 跌',f(c.edge_up,3)+' / '+f(c.edge_dn,3),'mut','模型概率 减 盘口卖价，仅供参考。回测显示按此差值买入是亏的（差值大通常是盘口对、模型错），不作为买入依据')
 +card('本场预判',c.pred?`${ud(c.pred)} (${f(c.p_pred,3)})`:'无',c.pred=='Up'?'up':(c.pred=='Down'?'dn':''),'开盘前20秒做出的预判')}
-$('top').innerHTML=h;
+setH('top',h);
+// 曲线数据没变时不重绘 canvas（每秒一次全量重绘是纯浪费）
+function plotCached(cv,lines,o={}){const last=l=>l.d.length?l.d[l.d.length-1]:0;
+const sig=JSON.stringify([lines.map(l=>[l.n,l.v,l.d.length,last(l)]),o.h||[],cv.clientWidth]);
+if(cv._sig===sig) return; cv._sig=sig; plot(cv,lines,o)}
 const bounds=[];for(let t=Math.ceil((d.now-420)/300)*300;t<=d.now;t+=300)bounds.push(t);
 const L=(i,n,col,v)=>({n,c:col,v,d:d.chart.map(r=>[r[0],r[i]])});
-plot($('c1'),[L(1,'参考价','#e6edf3',f(d.spot)),L(2,'币安','#58a6ff',f(d.bn,1)),L(3,'欧易','#a371f7',f(d.okx,1)),L(4,'官方60秒均价','#f0883e',f(d.chart&&d.chart.length?d.chart[d.chart.length-1][4]:null))],{v:bounds,h:c?[{y:c.p0,c:'#3fb950'}]:[],dec:0});
-const T=d.ticks||[];plot($('c2'),[
+plotCached($('c1'),[L(1,'参考价','#e6edf3',f(d.spot)),L(2,'币安','#58a6ff',f(d.bn,1)),L(3,'欧易','#a371f7',f(d.okx,1)),L(4,'官方60秒均价','#f0883e',f(d.chart&&d.chart.length?d.chart[d.chart.length-1][4]:null))],{v:bounds,h:c?[{y:c.p0,c:'#3fb950'}]:[],dec:0});
+const T=d.ticks||[];plotCached($('c2'),[
 {n:'P(涨)',v:c?f(c.p,3):'-',c:'#3fb950',d:T.map(r=>[r[0],r[1]])},
 {n:'涨卖',v:c?f(c.up_ask,2):'-',c:'#f85149',d:T.map(r=>[r[0],r[3]])},
 {n:'涨买',v:c?f(c.up_bid,2):'-',c:'#d29922',d:T.map(r=>[r[0],r[2]])},
 {n:'跌买',v:c?f(c.dn_bid,2):'-',c:'#39c5cf',d:T.map(r=>[r[0],r[4]])}
 ],{x0:0,x1:300,y0:0,y1:1,v:[240],h:[{y:.5,c:'#555'}],dec:2});
-const n=d.nxt;$('nxt').innerHTML=n?`场次 ${hm(n.start)}：`+(n.pred?`<b class="${n.pred=='Up'?'up':'dn'}">${ud(n.pred)}</b>，概率 ${f(n.p,3)} ${n.conf?'（信号较强）':'（信号弱）'}`:`将在开盘前20秒给出预判（还有 ${Math.max(0,n.start-d.now).toFixed(0)} 秒）`):'';
+const n=d.nxt;setH('nxt',n?`场次 ${hm(n.start)}：`+(n.pred?`<b class="${n.pred=='Up'?'up':'dn'}">${ud(n.pred)}</b>，概率 ${f(n.p,3)} ${n.conf?'（信号较强）':'（信号弱）'}`:`将在开盘前20秒给出预判（还有 ${Math.max(0,n.start-d.now).toFixed(0)} 秒）`):'');
 const st=d.stats||{};const shownTip=(st.shown!=null&&st.n>st.shown)?`　<span class=mut>（表内最近 ${st.shown} 场）</span>`:'';
-$('stats').innerHTML=`共 ${st.n||0} 场，命中率 ${st.acc==null?'-':(st.acc*100).toFixed(1)+'%'} ｜ 信号较强 ${st.cn||0} 场，命中率 ${st.cacc==null?'-':(st.cacc*100).toFixed(1)+'%'}　<span class=mut>（开盘前预判长期接近50%属正常，样本需几百场才有意义）</span>${shownTip}`;
-roundsCache=(d.rounds||[]).slice().reverse();
+setH('stats',`共 ${st.n||0} 场，命中率 ${st.acc==null?'-':(st.acc*100).toFixed(1)+'%'} ｜ 信号较强 ${st.cn||0} 场，命中率 ${st.cacc==null?'-':(st.cacc*100).toFixed(1)+'%'}　<span class=mut>（开盘前预判长期接近50%属正常，样本需几百场才有意义）</span>${shownTip}`);
+roundsPage=d.rounds||roundsPage; page=roundsPage.page||page;
 renderRounds();
 renderPaper(d)}
 function renderPaper(d){
@@ -1634,8 +1784,7 @@ const ps=d.paper_stats||{};
 const pct=x=>x==null?'-':(x*100).toFixed(1)+'%';
 const sg=p=>{const s=(ps.by_sig||{})[p]||{};return `${SIGT[p]} ${s.trades||0}笔/${s.settled||0}结算 胜率 ${pct(s.win_rate)} 盈亏 ${s.pnl==null?'-':((s.pnl>=0?'+':'')+Number(s.pnl).toFixed(3))}U`};
 const cp=d.cur&&d.cur.paper;
-$('paperStats').innerHTML=`合计 ${ps.n||0} 笔｜结算 ${ps.settled||0}｜胜率 ${pct(ps.win_rate)}｜盈亏 ${ps.pnl==null?'-':((ps.pnl>=0?'+':'')+Number(ps.pnl).toFixed(3))} U　｜　${sg('pre')}　｜　${sg('strong')}　｜　${sg('weak')}`+(cp?`　｜　本场最近成交[${SIGT[cp.sig]||cp.sig}]：${ud(cp.side)} @ ${f(cp.buy_price,3)} × ${f(cp.amount,2)}U，相对开盘 ${cp.tau>0?'+':''}${f(cp.tau,0)}s`:'');
-const pp=d.paper||{rows:[],page:1,pages:1,total:0,size:PAPER_PAGE_SIZE};
+setH('paperStats',`合计 ${ps.n||0} 笔｜结算 ${ps.settled||0}｜胜率 ${pct(ps.win_rate)}｜盈亏 ${ps.pnl==null?'-':((ps.pnl>=0?'+':'')+Number(ps.pnl).toFixed(3))} U　｜　${sg('pre')}　｜　${sg('strong')}　｜　${sg('weak')}`+(cp?`　｜　本场最近成交[${SIGT[cp.sig]||cp.sig}]：${ud(cp.side)} @ ${f(cp.buy_price,3)} × ${f(cp.amount,2)}U，相对开盘 ${cp.tau>0?'+':''}${f(cp.tau,0)}s`:''));const pp=d.paper||{rows:[],page:1,pages:1,total:0,size:PAPER_PAGE_SIZE};
 let t='<table><tr><th>买入时间(UTC)</th><th>信号</th><th>方向</th><th>买入价</th><th>金额(U)</th><th>份额</th><th>相对开盘(秒)</th><th>BTC</th><th>差值($)</th><th>差值(bps)</th><th>预判概率</th><th>结果</th><th>命中</th><th>盈亏(U)</th></tr>';
 (pp.rows||[]).slice().reverse().forEach(r=>{const hit=r.settled? (r.hit?'✔ 中':'✘ 错'):'待结';
 const hc=r.settled?(r.hit?'up':'dn'):'mut';
@@ -1643,16 +1792,15 @@ const pc=r.settled?(r.pnl>=0?'up':'dn'):'mut';
 const sig=r.sig||'strong';
 const tag=`<span style="color:${SIGC[sig]||'#7d8590'}">${SIGT[sig]||sig}</span>`;
 t+=`<tr><td>${r.time_utc||'-'}</td><td>${tag}</td><td class="${r.side=='Up'?'up':'dn'}">${ud(r.side)}</td><td>${f(r.buy_price,3)}</td><td>${f(r.amount,2)}</td><td>${f(r.shares,3)}</td><td>${r.tau>0?'+':''}${f(r.tau,0)}</td><td>${f(r.btc)}</td><td>${r.btc_diff==null?'-':((r.btc_diff>=0?'+':'')+f(r.btc_diff))}</td><td>${f(r.btc_diff_bps,1)}</td><td>${f(r.p_pred,3)}</td><td>${ud(r.outcome)}</td><td class="${hc}">${hit}</td><td class="${pc}">${r.settled?(r.pnl>=0?'+':'')+f(r.pnl,3):'-'}</td></tr>`});
-$('paperTbl').innerHTML=t+'</table>';
-const tp=pp.pages||1, pg=pp.page||1;
+setH('paperTbl',t+'</table>');const tp=pp.pages||1, pg=pp.page||1;
 let nums=''; const from=Math.max(1,pg-2), to=Math.min(tp,pg+2);
 for(let i=from;i<=to;i++) nums+=`<button class="${i===pg?'on':''}" onclick="gotoPaper(${i})">${i}</button>`;
-$('paperPager').innerHTML=`<button ${pg<=1?'disabled':''} onclick="gotoPaper(1)">首页</button>
+setH('paperPager',`<button ${pg<=1?'disabled':''} onclick="gotoPaper(1)">首页</button>
 <button ${pg<=1?'disabled':''} onclick="gotoPaper(${pg-1})">上一页</button>${nums}
 <button ${pg>=tp?'disabled':''} onclick="gotoPaper(${pg+1})">下一页</button>
 <button ${pg>=tp?'disabled':''} onclick="gotoPaper(${tp})">末页</button>
 <span class="info">第 ${pg}/${tp} 页，每页 ${pp.size||PAPER_PAGE_SIZE} 笔，共 ${pp.total||0} 笔</span>
-<button class="danger" onclick="clearPaper()">清空</button>`}
+<button class="danger" onclick="clearPaper()">清空</button>`)}
 function gotoPaper(p){paperPage=Math.max(1,p||1);tick()}
 async function clearPaper(){
 if(!confirm('确定清空模拟成交记录？\n统计会归零，paper_trades.csv 会归档为 .cleared 备份。\n下单参数配置不受影响。')) return;
@@ -1675,7 +1823,7 @@ const j=await r.json();
 if(!r.ok||!j.ok){alert(j.error||('保存失败 '+r.status));return}
 alert('已保存');tick()}
 catch(e){alert('保存失败: '+e)}}
-async function tick(){try{const sep=Q?Q+'&':'?';const r=await fetch('/api/state'+Q+sep+'ppage='+paperPage+'&psize='+PAPER_PAGE_SIZE);if(!r.ok){$('feeds').textContent=r.status==401?'访问口令错误：请在网址后加 ?token=你的口令（在服务器执行 btc5m url 查看）':'请求失败 HTTP '+r.status;return}draw(await r.json())}catch(e){$('feeds').textContent='无法连接服务器，稍后自动重试…'}}
+async function tick(){try{const sep=Q?Q+'&':'?';const r=await fetch('/api/state'+Q+sep+'ppage='+paperPage+'&psize='+PAPER_PAGE_SIZE+'&rpage='+page+'&rsize='+PAGE_SIZE);if(!r.ok){$('feeds').textContent=r.status==401?'访问口令错误：请在网址后加 ?token=你的口令（在服务器执行 btc5m url 查看）':'请求失败 HTTP '+r.status;return}draw(await r.json())}catch(e){$('feeds').textContent='无法连接服务器，稍后自动重试…'}}
 tick();setInterval(tick,1000);
 </script></body></html>'''
 

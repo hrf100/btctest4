@@ -29,3 +29,5 @@ curl -fsSL https://raw.githubusercontent.com/hrf100/btctest4/main/test4/run.sh |
 「模型−卖价」差值仅作参考，不作为买入依据。配置存 `data/paper_cfg.json`，成交存 `data/paper_trades.csv`。
 
 默认看板端口 `9999`。私钥写在 `~/.btc5m-4.env` 的 `POLY_PRIVATE_KEY`。
+
+顶栏「本进程 CPU」是本服务自身占用（单核百分比），「整机 CPU」是整台机器（含其它进程）。日志每 30 秒输出一行 `cpu ticker ...ms/s` 与 WS 消息量，用于定位负载来源。
