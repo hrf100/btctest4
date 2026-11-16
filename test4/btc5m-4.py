@@ -37,14 +37,16 @@ PAPER_CFG_PATH = f"{DATA}/paper_cfg.json"
 PAPER_CSV = f"{DATA}/paper_trades.csv"
 DASH_TOKEN = os.getenv("DASH_TOKEN", "")
 T5 = aiohttp.ClientTimeout(total=5)
-# 模拟下单默认: 开盘后 max_tau 秒内, 目标侧卖一 <= buy_price 则按卖一成交 amount U
-# strong = 信号较强场次, weak = 非强信号场次, 两套独立开关/买价/金额/窗口
+# 模拟下单三档, 各自独立开关/参数, 同一场每档最多一笔:
+#   strong/weak: 开盘后 max_tau 秒内, 预测侧卖一 <= buy_price 则按卖一成交 amount U
+#   pre: 开盘前(预判后到开盘), |p-0.5| >= min_strength 且预测侧卖一 <= buy_price(上限) 则成交
 PAPER_DEFAULT = {
     "strong": {"enabled": True, "buy_price": 0.45, "max_tau": 150, "amount": 5.0},
     "weak": {"enabled": False, "buy_price": 0.45, "max_tau": 150, "amount": 5.0},
+    "pre": {"enabled": True, "min_strength": 0.08, "buy_price": 0.70, "amount": 5.0},
 }
-PAPER_PROFILES = ("strong", "weak")
-PAPER_PROFILE_LABEL = {"strong": "信号较强", "weak": "信号较弱"}
+PAPER_PROFILES = ("strong", "weak", "pre")
+PAPER_PROFILE_LABEL = {"strong": "信号较强", "weak": "信号较弱", "pre": "开盘前"}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("btc5m")
@@ -104,8 +106,33 @@ class St:
 S = St()
 
 
+def _paper_check(prof, c):
+    """校验单档参数, 返回 (归一化dict, 错误文案)。"""
+    d = PAPER_DEFAULT[prof]
+    lab = PAPER_PROFILE_LABEL[prof]
+    try:
+        out = {"enabled": bool(c.get("enabled", d["enabled"])),
+               "buy_price": round(float(c.get("buy_price", d["buy_price"])), 4),
+               "amount": round(float(c.get("amount", d["amount"])), 4)}
+        if "max_tau" in d:
+            out["max_tau"] = int(c.get("max_tau", d["max_tau"]))
+        if "min_strength" in d:
+            out["min_strength"] = round(float(c.get("min_strength", d["min_strength"])), 4)
+    except Exception:
+        return None, f"{lab}参数格式错误"
+    if not (0.01 <= out["buy_price"] <= 0.99):
+        return None, f"{lab}买价需在 0.01~0.99"
+    if not (0.1 <= out["amount"] <= 10000):
+        return None, f"{lab}金额需在 0.1~10000 U"
+    if "max_tau" in out and not (5 <= out["max_tau"] <= WIN):
+        return None, f"{lab}窗口需在 5~{WIN} 秒"
+    if "min_strength" in out and not (0.0 <= out["min_strength"] <= 0.49):
+        return None, f"{lab}强度需在 0~0.49"
+    return out, None
+
+
 def _norm_paper_cfg(cfg):
-    """归一化模拟下单配置; 兼容旧版扁平结构(enabled/buy_price/...)。"""
+    """归一化模拟下单配置; 兼容旧版扁平结构(enabled/buy_price/...); 非法值回落默认。"""
     out = {}
     legacy = {k: cfg[k] for k in ("enabled", "buy_price", "max_tau", "amount") if k in cfg}
     for prof in PAPER_PROFILES:
@@ -113,18 +140,8 @@ def _norm_paper_cfg(cfg):
         raw = cfg.get(prof)
         if not isinstance(raw, dict):
             raw = dict(d, **legacy) if (legacy and prof == "strong") else d
-        try:
-            bp = float(raw.get("buy_price", d["buy_price"]))
-            mt = int(raw.get("max_tau", d["max_tau"]))
-            am = float(raw.get("amount", d["amount"]))
-        except Exception:
-            bp, mt, am = d["buy_price"], d["max_tau"], d["amount"]
-        out[prof] = {
-            "enabled": bool(raw.get("enabled", d["enabled"])),
-            "buy_price": min(max(bp, 0.01), 0.99),
-            "max_tau": min(max(mt, 5), WIN),
-            "amount": max(am, 0.1),
-        }
+        c, err = _paper_check(prof, raw)
+        out[prof] = c if c else dict(d)
     return out
 
 
@@ -148,14 +165,12 @@ def save_paper_cfg(cfg=None):
         json.dump(cfg, fh, ensure_ascii=False, indent=2)
     S.paper_cfg = cfg
     for prof in PAPER_PROFILES:
-        c = cfg[prof]
-        log.info("模拟下单配置已保存[%s]: enabled=%s buy_price=%.2f max_tau=%ss amount=%.2fU",
-                 PAPER_PROFILE_LABEL[prof], c["enabled"], c["buy_price"], c["max_tau"], c["amount"])
+        log.info("模拟下单配置已保存[%s]: %s", PAPER_PROFILE_LABEL[prof], cfg[prof])
 
 
 def _paper_row_num(r):
     for k in ("buy_price", "amount", "shares", "btc", "p0", "btc_diff", "btc_diff_bps",
-              "p_pred", "fair_p", "pnl", "tau", "thresh"):
+              "p_pred", "fair_p", "pnl", "tau", "thresh", "strength"):
         if k in r:
             r[k] = _num(r[k], float)
     for k in ("start", "hit", "conf", "settled", "max_tau"):
@@ -237,59 +252,112 @@ def paper_page(page=1, size=20):
     return {"page": page, "size": size, "pages": pages, "total": total, "rows": chunk}
 
 
+PAPER_FIELDS = ("start", "time_utc", "sig", "tau", "side", "buy_price", "amount", "shares",
+                "thresh", "max_tau", "strength", "btc", "p0", "btc_diff", "btc_diff_bps",
+                "p_pred", "fair_p", "conf", "outcome", "hit", "pnl", "settled")
+
+
+def _ensure_paper_header():
+    """旧 paper_trades.csv 缺新列(sig/strength)时原地补齐表头, 保留全部旧数据。"""
+    if not os.path.exists(PAPER_CSV) or _csv_fields.get(PAPER_CSV) == list(PAPER_FIELDS):
+        return
+    with open(PAPER_CSV, newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+        head = rows and list(rows[0].keys())
+    if head and all(k in head for k in PAPER_FIELDS):
+        _csv_fields[PAPER_CSV] = head
+        return
+    for r in rows:
+        if not r.get("sig"):
+            r["sig"] = "strong" if str(r.get("conf")) == "1" else "weak"
+    with open(PAPER_CSV, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(PAPER_FIELDS), extrasaction="ignore", restval="")
+        w.writeheader()
+        w.writerows(rows)
+    _csv_fields[PAPER_CSV] = list(PAPER_FIELDS)
+    log.info("paper_trades.csv 已补齐表头 (%d 行)", len(rows))
+
+
+def _paper_done(w):
+    """该场次已成交的档位集合。"""
+    return w.setdefault("paper_done", set())
+
+
+def _record_paper(prof, s0, now, w, side, ask, cfg, p0, spot, fair_p, strength):
+    amount = float(cfg.get("amount") or 5.0)
+    shares = round(amount / float(ask), 4)
+    diff = (spot - p0) if (spot is not None and p0 is not None) else None
+    diff_bps = (diff / p0 * 1e4) if (diff is not None and p0) else None
+    row = {
+        "start": s0,
+        "time_utc": time.strftime("%m-%d %H:%M:%S", time.gmtime(now)),
+        "sig": prof,
+        "tau": round(now - s0, 1),
+        "side": side,
+        "buy_price": round(float(ask), 4),
+        "amount": round(amount, 4),
+        "shares": shares,
+        "thresh": float(cfg["buy_price"]),
+        "max_tau": int(cfg["max_tau"]) if "max_tau" in cfg else "",
+        "strength": round(strength, 4),
+        "btc": None if spot is None else round(float(spot), 2),
+        "p0": None if p0 is None else round(float(p0), 2),
+        "btc_diff": None if diff is None else round(float(diff), 2),
+        "btc_diff_bps": None if diff_bps is None else round(float(diff_bps), 2),
+        "p_pred": round(float(w.get("p_pred") or 0), 4),
+        "fair_p": round(float(fair_p or 0), 4),
+        "conf": int(bool(w.get("conf"))),
+        "outcome": "",
+        "hit": "",
+        "pnl": "",
+        "settled": 0,
+    }
+    _ensure_paper_header()
+    append_csv(PAPER_CSV, row)
+    S.paper.append(row)
+    _add_paper_stat(row)
+    _paper_done(w).add(prof)
+    w["paper_trade"] = row
+    log.info("模拟成交[%s] %s side=%s ask=%.3f<=%.2f amount=%.2fU shares=%.4f tau=%+.0fs 强度=%.3f btc=%s diff=%s",
+             PAPER_PROFILE_LABEL[prof], s0, side, ask, row["thresh"], amount, shares,
+             row["tau"], strength, row["btc"], row["btc_diff"])
+    return row
+
+
 def try_paper_fill(s0, now, cur, r, spot):
-    """按场次信号强弱选对应配置：开盘后 max_tau 内目标侧卖一 <= 买入价上限则模拟成交。"""
-    if cur.get("paper_filled") or not cur.get("pred"):
+    """开盘后档：按场次信号强弱选 strong/weak，开盘后 max_tau 内预测侧卖一 <= 买价上限则成交。"""
+    if not cur.get("pred"):
         return
     prof = "strong" if cur.get("conf") else "weak"
     cfg = (S.paper_cfg or {}).get(prof) or {}
-    if not cfg.get("enabled"):
+    if not cfg.get("enabled") or prof in _paper_done(cur):
         return
     tau = now - s0
     if tau < 0 or tau > float(cfg["max_tau"]):
         return
     side = cur["pred"]
     ask = r.get("up_ask") if side == "Up" else r.get("dn_ask")
-    thresh = float(cfg["buy_price"])
-    if ask is None or ask > thresh or ask <= 0:
+    if ask is None or ask <= 0 or ask > float(cfg["buy_price"]):
         return
-    amount = float(cfg.get("amount") or 5.0)
-    shares = round(amount / float(ask), 4)
-    p0 = r.get("p0")
-    btc = spot
-    diff = (btc - p0) if (btc is not None and p0 is not None) else None
-    diff_bps = (diff / p0 * 1e4) if (diff is not None and p0) else None
-    row = {
-        "start": s0,
-        "time_utc": time.strftime("%m-%d %H:%M:%S", time.gmtime(now)),
-        "sig": prof,
-        "tau": round(tau, 1),
-        "side": side,
-        "buy_price": round(float(ask), 4),
-        "amount": round(amount, 4),
-        "shares": shares,
-        "thresh": thresh,
-        "max_tau": int(cfg["max_tau"]),
-        "btc": None if btc is None else round(float(btc), 2),
-        "p0": None if p0 is None else round(float(p0), 2),
-        "btc_diff": None if diff is None else round(float(diff), 2),
-        "btc_diff_bps": None if diff_bps is None else round(float(diff_bps), 2),
-        "p_pred": round(float(cur.get("p_pred") or 0), 4),
-        "fair_p": round(float(r.get("p") or 0), 4),
-        "conf": 1 if prof == "strong" else 0,
-        "outcome": "",
-        "hit": "",
-        "pnl": "",
-        "settled": 0,
-    }
-    append_csv(PAPER_CSV, row)
-    S.paper.append(row)
-    _add_paper_stat(row)
-    cur["paper_filled"] = True
-    cur["paper_trade"] = row
-    log.info("模拟成交[%s] %s side=%s ask=%.3f<=%.2f amount=%.2fU shares=%.4f tau=%.0fs btc=%s diff=%s",
-             PAPER_PROFILE_LABEL[prof], s0, side, ask, thresh, amount, shares, tau,
-             row["btc"], row["btc_diff"])
+    _record_paper(prof, s0, now, cur, side, ask, cfg, r.get("p0"), spot, r.get("p"),
+                  abs(float(cur.get("p_pred") or 0.5) - 0.5))
+
+
+def try_paper_pre(s, now, w, spot):
+    """开盘前档：预判完成后、开盘前，|p-0.5| >= min_strength 且预测侧卖一 <= 上限则按卖价成交。
+    只看模型强度，不看「模型概率-卖价」；卖价只作为买贵了的上限。"""
+    cfg = (S.paper_cfg or {}).get("pre") or {}
+    if not cfg.get("enabled") or "pre" in _paper_done(w) or not w.get("pred") or now >= s:
+        return
+    strength = abs(float(w.get("p_pred") or 0.5) - 0.5)
+    if strength < float(cfg["min_strength"]):
+        return
+    side = w["pred"]
+    _, ask = quote(w["up"] if side == "Up" else w["dn"])
+    if ask is None or ask <= 0 or ask > float(cfg["buy_price"]):
+        return
+    rp = w.get("r_pred") or {}
+    _record_paper("pre", s, now, w, side, ask, cfg, rp.get("p0"), spot, w.get("p_pred"), strength)
 
 
 def settle_paper(s, outcome):
@@ -331,7 +399,8 @@ def settle_paper(s, outcome):
             S.paper_pnl += d_pnl
             p["wins"] += d_hit
             p["pnl"] += d_pnl
-        _patch_csv(PAPER_CSV, s, {"outcome": outcome, "hit": hit, "pnl": pnl, "settled": 1})
+        _patch_csv(PAPER_CSV, s, {"outcome": outcome, "hit": hit, "pnl": pnl, "settled": 1},
+                   match={"sig": row.get("sig") or "strong"})
         log.info("模拟结算[%s] %s side=%s outcome=%s %s amount=%.2fU pnl=%+.3f",
                  PAPER_PROFILE_LABEL.get(row.get("sig"), row.get("sig")), s, row.get("side"),
                  outcome, "HIT" if hit else "MISS", amount, pnl)
@@ -936,18 +1005,19 @@ def make_pred(s):
              s, w["pred"], p, r["mu"], r["sd"], rn, quote(w["up"]), quote(w["dn"]))
 
 
-def _patch_csv(path, start, updates):
-    """按 start 更新已有行; 没有该文件或找不到行则忽略。"""
+def _patch_csv(path, start, updates, match=None):
+    """按 start(及 match 里的列)更新第一条匹配行; 没有该文件或找不到行则忽略。"""
     if not os.path.exists(path):
         return
-    with open(path, newline="") as fh:
+    with open(path, newline="", encoding="utf-8") as fh:
         rows = list(csv.DictReader(fh))
     if not rows:
         return
     fields = list(rows[0].keys())
     hit = False
     for row in rows:
-        if str(row.get("start")) == str(start):
+        if str(row.get("start")) == str(start) and all(
+                str(row.get(k) or "") == str(v) for k, v in (match or {}).items() if k in fields):
             for k, v in updates.items():
                 if k in fields:
                     row[k] = v
@@ -1078,15 +1148,17 @@ async def ticker(sess):
             s0 = int(now // WIN) * WIN
             for s in (s0, s0 + WIN):
                 if s not in S.win:
-                    filled = any(int(x.get("start") or 0) == s for x in S.paper)
+                    done = {x.get("sig") or "strong" for x in S.paper if int(x.get("start") or 0) == s}
                     S.win[s] = {"start": s, "up": None, "dn": None, "pred": None, "pred_done": False,
-                                "ticks": [], "paper_filled": filled}
+                                "ticks": [], "paper_done": done}
                     asyncio.create_task(init_window(sess, s))
                     asyncio.create_task(settle(sess, s))
             nxt = s0 + WIN
             if nxt - now <= LEAD and not S.win[nxt]["pred_done"]:
                 make_pred(nxt)
             ref, rn = get_ref()
+            if S.win[nxt]["pred_done"]:
+                try_paper_pre(nxt, now, S.win[nxt], ref.last())
             if int(now) % 5 == 0:
                 sg = est_sigma_h(ref, now)
                 if sg:
@@ -1309,7 +1381,7 @@ async def api_export_data(req):
                 "rounds_v2.csv": "每场预判与结果：start/pred/p_pred/conf/outcome/hit/label/P0/收盘均价/预判时卖价/特征",
                 "outcomes.csv": "每场结算结果(p0/c 自算与官方 TWAP)",
                 "ticks.csv": "场中每 2 秒 tick：p_up/盘口买卖价/P0/特征",
-                "paper_trades.csv": "模拟成交：sig(强/普)/buy_price/amount/shares/btc/p0/btc_diff/pnl",
+                "paper_trades.csv": "模拟成交：sig(pre前/strong强/weak普)/tau相对开盘秒/strength模型强度/buy_price/amount/shares/btc/p0/btc_diff/pnl",
                 "paper_cfg.json": "模拟下单参数",
                 "calib.json": "Platt 校准参数",
             },
@@ -1354,7 +1426,7 @@ async def api_paper_clear(req):
         os.rename(path, archived)
     _csv_fields.pop(path, None)
     for w in S.win.values():
-        w["paper_filled"] = False
+        w["paper_done"] = set()
         w.pop("paper_trade", None)
     log.info("已清空模拟成交 %d 笔%s", n, f"，归档 {archived}" if archived else "")
     return web.json_response({"ok": True, "cleared": n, "archived": archived})
@@ -1371,32 +1443,16 @@ async def api_paper_cfg(req):
     except Exception:
         return web.json_response({"ok": False, "error": "bad json"}, status=400)
     cfg = {k: dict(v) for k, v in S.paper_cfg.items()}
-    legacy = {k: body[k] for k in ("enabled", "buy_price", "max_tau", "amount") if k in body}
     for prof in PAPER_PROFILES:
         patch = body.get(prof)
-        if isinstance(patch, dict):
-            cur = dict(cfg.get(prof) or PAPER_DEFAULT[prof])
-            cur.update({k: v for k, v in patch.items() if k in PAPER_DEFAULT[prof]})
-        elif legacy:
-            cur = dict(cfg.get(prof) or PAPER_DEFAULT[prof], **legacy)
-        else:
+        if not isinstance(patch, dict):
             continue
-        if "enabled" in cur:
-            cur["enabled"] = bool(cur["enabled"])
-        try:
-            bp = float(cur["buy_price"])
-            mt = int(cur["max_tau"])
-            am = float(cur["amount"])
-        except Exception:
-            return web.json_response({"ok": False, "error": f"{prof} 参数格式错误"}, status=400)
-        if not (0.01 <= bp <= 0.99):
-            return web.json_response({"ok": False, "error": f"{PAPER_PROFILE_LABEL[prof]}买入价需在 0.01~0.99"}, status=400)
-        if not (5 <= mt <= WIN):
-            return web.json_response({"ok": False, "error": f"{PAPER_PROFILE_LABEL[prof]}窗口需在 5~{WIN} 秒"}, status=400)
-        if not (0.1 <= am <= 10000):
-            return web.json_response({"ok": False, "error": f"{PAPER_PROFILE_LABEL[prof]}金额需在 0.1~10000 U"}, status=400)
-        cfg[prof] = {"enabled": cur["enabled"], "buy_price": round(bp, 4),
-                     "max_tau": mt, "amount": round(am, 4)}
+        cur = dict(cfg.get(prof) or PAPER_DEFAULT[prof])
+        cur.update({k: v for k, v in patch.items() if k in PAPER_DEFAULT[prof]})
+        c, err = _paper_check(prof, cur)
+        if err:
+            return web.json_response({"ok": False, "error": err}, status=400)
+        cfg[prof] = c
     save_paper_cfg(cfg)
     return web.json_response({"ok": True, "cfg": S.paper_cfg})
 
@@ -1450,7 +1506,7 @@ table{border-collapse:collapse;width:100%}td,th{padding:3px 6px;border-bottom:1p
 <h3>本场盘口</h3><div class="tip">绿=P(涨)　红=涨卖　黄=涨买　青=跌买</div><canvas id="c2"></canvas>
 <h3>下一场预判</h3><div id="nxt"></div>
 <h3>模拟下单</h3>
-<div class="tip">按场次信号分两档，各自独立开关/买价/金额/窗口。开盘后设定秒数内，若预判方向卖一 ≤ 买入价上限，按当时卖一投入设定金额（份额=金额/买价）。差值 = BTC − 开盘基准价 P0。盈亏：中 +金额×(1/买价−1)，错 −金额。</div>
+<div class="tip">三档独立，同一场每档最多一笔。<b>开盘前</b>：预判后到开盘，模型强度 |p−0.5| ≥ 设定值且预判方向卖一 ≤ 卖价上限即按卖一买入（只看模型强度，卖价只防买贵）。<b>强 / 普</b>：开盘后设定秒数内，预判方向卖一 ≤ 买价上限才买。份额 = 金额 / 买价；盈亏：中 +金额×(1/买价−1)，错 −金额；差值 = BTC − 开盘基准价 P0。</div>
 <div class="paper-bar" id="paperBar"></div>
 <div id="paperStats" class="tip"></div>
 <div id="paperPager" class="pager"></div>
@@ -1467,6 +1523,7 @@ const hm=s=>new Date(s*1000).toISOString().slice(11,16)+' UTC';
 const age=a=>a==null?'<span class=dn>无数据</span>':(a<5?`<span class=up>${a.toFixed(1)}秒</span>`:`<span class=warn>${a.toFixed(0)}秒</span>`);
 const PAGE_SIZE=20; let page=1, roundsCache=[];
 const PAPER_PAGE_SIZE=20; let paperPage=1;
+const SIGT={pre:'前',strong:'强',weak:'普'}, SIGN={pre:'开盘前买入',strong:'强信号·开盘后',weak:'普通信号·开盘后'}, SIGC={pre:'#f0883e',strong:'#58a6ff',weak:'#a371f7'};
 function plot(cv,lines,o={}){const dpr=devicePixelRatio||1,W=cv.clientWidth,H=cv.clientHeight;cv.width=W*dpr;cv.height=H*dpr;
 const g=cv.getContext('2d');g.scale(dpr,dpr);let xs=[],ys=[];lines.forEach(l=>l.d.forEach(p=>{if(p[1]!=null){xs.push(p[0]);ys.push(p[1])}}));
 (o.h||[]).forEach(h=>ys.push(h.y));if(!xs.length)return;
@@ -1541,7 +1598,7 @@ if(c){h+=card('本场剩余',Math.max(0,c.end-d.now).toFixed(0)+' 秒')
 +card('模型：涨的概率',f(c.p,3),c.p>=.5?'up':'dn','模型估计的“涨”概率')
 +card('“涨” 买一 / 卖一',f(c.up_bid,2)+' / '+f(c.up_ask,2),'','Polymarket上“涨”份额的最高买价 / 最低卖价')
 +card('“跌” 买一 / 卖一',f(c.dn_bid,2)+' / '+f(c.dn_ask,2),'','Polymarket上“跌”份额的最高买价 / 最低卖价')
-+card('模型优势：涨 / 跌',f(c.edge_up,3)+' / '+f(c.edge_dn,3),(c.edge_up>.05||c.edge_dn>.05)?'warn':'','模型概率 减 盘口卖价。为正说明该方向按模型被低估；超过0.05会高亮（未扣手续费）')
++card('模型−卖价：涨 / 跌',f(c.edge_up,3)+' / '+f(c.edge_dn,3),'mut','模型概率 减 盘口卖价，仅供参考。回测显示按此差值买入是亏的（差值大通常是盘口对、模型错），不作为买入依据')
 +card('本场预判',c.pred?`${ud(c.pred)} (${f(c.p_pred,3)})`:'无',c.pred=='Up'?'up':(c.pred=='Down'?'dn':''),'开盘前20秒做出的预判')}
 $('top').innerHTML=h;
 const bounds=[];for(let t=Math.ceil((d.now-420)/300)*300;t<=d.now;t+=300)bounds.push(t);
@@ -1563,28 +1620,29 @@ function renderPaper(d){
 const cfg=d.paper_cfg||{};
 const editing=document.activeElement&&document.activeElement.closest&&document.activeElement.closest('#paperBar');
 if(!editing){
-const PROF=['strong','weak'];
 let b='';
-PROF.forEach((p)=>{const c=cfg[p]||{};
-b+=`<span class="pg" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding:4px 8px;border:1px solid #30363d;border-radius:6px"><b style="color:${p=='strong'?'#58a6ff':'#a371f7'}">${p=='strong'?'强信号':'普通信号'}</b>
-<label><input type="checkbox" id="en_${p}" ${c.enabled?'checked':''}> 启用</label>
-<label>买价上限 <input type="number" id="bp_${p}" min="0.01" max="0.99" step="0.01" value="${c.buy_price??0.45}"></label>
-<label>金额(U) <input type="number" id="am_${p}" min="0.1" max="10000" step="0.1" value="${c.amount??5}"></label>
-<label>窗口(秒) <input type="number" id="mt_${p}" min="5" max="300" step="1" value="${c.max_tau??150}"></label></span>`});
+['pre','strong','weak'].forEach((p)=>{const c=cfg[p]||{};
+b+=`<span class="pg" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding:4px 8px;border:1px solid #30363d;border-radius:6px"><b style="color:${SIGC[p]}">${SIGN[p]}</b>
+<label><input type="checkbox" id="en_${p}" ${c.enabled?'checked':''}> 启用</label>`
++(p=='pre'?`<label>强度≥ <input type="number" id="ms_${p}" min="0" max="0.49" step="0.01" value="${c.min_strength??0.08}"></label>`:'')
++`<label>${p=='pre'?'卖价上限':'买价上限'} <input type="number" id="bp_${p}" min="0.01" max="0.99" step="0.01" value="${c.buy_price??0.45}"></label>
+<label>金额(U) <input type="number" id="am_${p}" min="0.1" max="10000" step="0.1" value="${c.amount??5}"></label>`
++(p=='pre'?'':`<label>窗口(秒) <input type="number" id="mt_${p}" min="5" max="300" step="1" value="${c.max_tau??150}"></label>`)+`</span>`});
 b+=`<button onclick="savePaper()">保存</button><span class="mut" id="paperHint"></span>`;
 $('paperBar').innerHTML=b}
 const ps=d.paper_stats||{};
 const pct=x=>x==null?'-':(x*100).toFixed(1)+'%';
-const sg=p=>{const s=(ps.by_sig||{})[p]||{};return `${p=='strong'?'强':'普'} ${s.trades||0}笔/${s.settled||0}结算 胜率 ${pct(s.win_rate)} 盈亏 ${s.pnl==null?'-':((s.pnl>=0?'+':'')+Number(s.pnl).toFixed(3))}U`};
-$('paperStats').innerHTML=`合计 ${ps.n||0} 笔｜结算 ${ps.settled||0}｜胜率 ${pct(ps.win_rate)}｜盈亏 ${ps.pnl==null?'-':((ps.pnl>=0?'+':'')+Number(ps.pnl).toFixed(3))} U　｜　${sg('strong')}　｜　${sg('weak')}`+(d.cur&&d.cur.paper?`　｜　本场已成交[${d.cur.paper.sig=='strong'?'强':'普'}]：${ud(d.cur.paper.side)} @ ${f(d.cur.paper.buy_price,3)} × ${f(d.cur.paper.amount,2)}U，开盘后 ${f(d.cur.paper.tau,0)}s`:'');
+const sg=p=>{const s=(ps.by_sig||{})[p]||{};return `${SIGT[p]} ${s.trades||0}笔/${s.settled||0}结算 胜率 ${pct(s.win_rate)} 盈亏 ${s.pnl==null?'-':((s.pnl>=0?'+':'')+Number(s.pnl).toFixed(3))}U`};
+const cp=d.cur&&d.cur.paper;
+$('paperStats').innerHTML=`合计 ${ps.n||0} 笔｜结算 ${ps.settled||0}｜胜率 ${pct(ps.win_rate)}｜盈亏 ${ps.pnl==null?'-':((ps.pnl>=0?'+':'')+Number(ps.pnl).toFixed(3))} U　｜　${sg('pre')}　｜　${sg('strong')}　｜　${sg('weak')}`+(cp?`　｜　本场最近成交[${SIGT[cp.sig]||cp.sig}]：${ud(cp.side)} @ ${f(cp.buy_price,3)} × ${f(cp.amount,2)}U，相对开盘 ${cp.tau>0?'+':''}${f(cp.tau,0)}s`:'');
 const pp=d.paper||{rows:[],page:1,pages:1,total:0,size:PAPER_PAGE_SIZE};
-let t='<table><tr><th>买入时间(UTC)</th><th>信号</th><th>方向</th><th>买入价</th><th>金额(U)</th><th>份额</th><th>开盘后秒</th><th>BTC</th><th>差值($)</th><th>差值(bps)</th><th>预判概率</th><th>结果</th><th>命中</th><th>盈亏(U)</th></tr>';
+let t='<table><tr><th>买入时间(UTC)</th><th>信号</th><th>方向</th><th>买入价</th><th>金额(U)</th><th>份额</th><th>相对开盘(秒)</th><th>BTC</th><th>差值($)</th><th>差值(bps)</th><th>预判概率</th><th>结果</th><th>命中</th><th>盈亏(U)</th></tr>';
 (pp.rows||[]).slice().reverse().forEach(r=>{const hit=r.settled? (r.hit?'✔ 中':'✘ 错'):'待结';
 const hc=r.settled?(r.hit?'up':'dn'):'mut';
 const pc=r.settled?(r.pnl>=0?'up':'dn'):'mut';
-const strong=(r.sig||'strong')=='strong';
-const tag=strong?'<span style="color:#58a6ff">强</span>':'<span style="color:#a371f7">普</span>';
-t+=`<tr><td>${r.time_utc||'-'}</td><td>${tag}</td><td class="${r.side=='Up'?'up':'dn'}">${ud(r.side)}</td><td>${f(r.buy_price,3)}</td><td>${f(r.amount,2)}</td><td>${f(r.shares,3)}</td><td>${f(r.tau,0)}</td><td>${f(r.btc)}</td><td>${r.btc_diff==null?'-':((r.btc_diff>=0?'+':'')+f(r.btc_diff))}</td><td>${f(r.btc_diff_bps,1)}</td><td>${f(r.p_pred,3)}</td><td>${ud(r.outcome)}</td><td class="${hc}">${hit}</td><td class="${pc}">${r.settled?(r.pnl>=0?'+':'')+f(r.pnl,3):'-'}</td></tr>`});
+const sig=r.sig||'strong';
+const tag=`<span style="color:${SIGC[sig]||'#7d8590'}">${SIGT[sig]||sig}</span>`;
+t+=`<tr><td>${r.time_utc||'-'}</td><td>${tag}</td><td class="${r.side=='Up'?'up':'dn'}">${ud(r.side)}</td><td>${f(r.buy_price,3)}</td><td>${f(r.amount,2)}</td><td>${f(r.shares,3)}</td><td>${r.tau>0?'+':''}${f(r.tau,0)}</td><td>${f(r.btc)}</td><td>${r.btc_diff==null?'-':((r.btc_diff>=0?'+':'')+f(r.btc_diff))}</td><td>${f(r.btc_diff_bps,1)}</td><td>${f(r.p_pred,3)}</td><td>${ud(r.outcome)}</td><td class="${hc}">${hit}</td><td class="${pc}">${r.settled?(r.pnl>=0?'+':'')+f(r.pnl,3):'-'}</td></tr>`});
 $('paperTbl').innerHTML=t+'</table>';
 const tp=pp.pages||1, pg=pp.page||1;
 let nums=''; const from=Math.max(1,pg-2), to=Math.min(tp,pg+2);
@@ -1608,7 +1666,10 @@ tick();
 }catch(e){alert('清空失败: '+e)}}
 async function savePaper(){
 const body={};
-[['strong'],['weak']].forEach(([p])=>{body[p]={enabled:$('en_'+p).checked,buy_price:Number($('bp_'+p).value),amount:Number($('am_'+p).value),max_tau:Number($('mt_'+p).value)}});
+['pre','strong','weak'].forEach(p=>{const o={enabled:$('en_'+p).checked,buy_price:Number($('bp_'+p).value),amount:Number($('am_'+p).value)};
+if($('mt_'+p))o.max_tau=Number($('mt_'+p).value);
+if($('ms_'+p))o.min_strength=Number($('ms_'+p).value);
+body[p]=o});
 try{const r=await fetch('/api/paper/cfg'+Q,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
 const j=await r.json();
 if(!r.ok||!j.ok){alert(j.error||('保存失败 '+r.status));return}
@@ -1638,10 +1699,7 @@ async def main(host, port):
         await web.TCPSite(runner, host, port).start()
         log.info("看板: http://%s:%s/%s", host, port, f"?token={DASH_TOKEN}" if DASH_TOKEN else "")
         for _prof in PAPER_PROFILES:
-            _c = S.paper_cfg[_prof]
-            log.info("模拟下单[%s]: enabled=%s buy_price=%.2f max_tau=%ss amount=%.2fU",
-                     PAPER_PROFILE_LABEL[_prof], _c["enabled"], _c["buy_price"],
-                     _c["max_tau"], _c["amount"])
+            log.info("模拟下单[%s]: %s", PAPER_PROFILE_LABEL[_prof], S.paper_cfg[_prof])
         await asyncio.gather(ws_poly(sess), ws_binance(sess), ws_okx(sess),
                              ticker(sess), pm_fallback(sess), cl_watchdog(), status())
 

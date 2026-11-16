@@ -18,4 +18,14 @@ curl -fsSL https://raw.githubusercontent.com/hrf100/btctest4/main/test4/run.sh |
 | `test4/run.sh` | 服务器安装与 systemd 服务 |
 | `btc5m.py` | 早期采集版 |
 
+## 模拟下单（三档，共用列表，标记 前/强/普）
+
+| 档位 | 触发 | 默认 |
+|------|------|------|
+| 开盘前 `pre` | 预判后、开盘前，模型强度 \|p−0.5\| ≥ 阈值 且 预判方向卖一 ≤ 上限 | 强度 0.08，上限 0.70，5U |
+| 强信号 `strong` | 开盘后窗口内，预判方向卖一 ≤ 买价上限 | 0.45，150s，5U |
+| 普通信号 `weak` | 同上（非强信号场次），默认关闭 | 0.45，150s，5U |
+
+「模型−卖价」差值仅作参考，不作为买入依据。配置存 `data/paper_cfg.json`，成交存 `data/paper_trades.csv`。
+
 默认看板端口 `9999`。私钥写在 `~/.btc5m-4.env` 的 `POLY_PRIVATE_KEY`。
