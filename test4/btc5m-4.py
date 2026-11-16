@@ -15,7 +15,7 @@ BTC-test4 —— Polymarket BTC 5分钟涨跌盘: 场次预判 + 场中公允概
 服务器一行安装/更新（长久 systemd 服务；已在跑会先停再启）:
   curl -fsSL https://raw.githubusercontent.com/hrf100/btctest4/main/test4/run.sh | bash
 """
-import asyncio, json, time, math, csv, os, logging, argparse
+import asyncio, json, time, math, csv, os, logging, argparse, io, zipfile
 from bisect import bisect_left, bisect_right
 from collections import deque
 import aiohttp
@@ -1251,8 +1251,12 @@ async def api_state(req):
                               "paper_stats": paper_stats()})
 
 
+DATA_FILES = ("rounds_v2.csv", "outcomes.csv", "ticks.csv", "paper_trades.csv",
+              "paper_cfg.json", "calib.json")
+
+
 async def api_export_rounds(req):
-    """导出历史场次 CSV（全量，来自 rounds_v2.csv）。"""
+    """导出历史场次 CSV（只含 rounds_v2.csv）。"""
     if not _auth(req):
         return web.Response(status=401, text="bad token")
     path = f"{DATA}/rounds_v2.csv"
@@ -1267,6 +1271,55 @@ async def api_export_rounds(req):
         body = b"\xef\xbb\xbf" + body      # 加 BOM，Excel 直接打开不乱码
     log.info("导出历史场次 %s (%d 字节)", name, len(body))
     return web.Response(body=body, content_type="text/csv", charset="utf-8",
+                        headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
+async def api_export_data(req):
+    """打包导出全部策略数据文件(zip): 场次/结果/行情 tick/模拟成交/配置/校准。"""
+    if not _auth(req):
+        return web.Response(status=401, text="bad token")
+    with_bak = req.query.get("bak") in ("1", "true", "yes")
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    buf = io.BytesIO()
+    included, skipped = [], []
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        names = list(DATA_FILES)
+        if with_bak:
+            for f in sorted(os.listdir(DATA)):
+                if any(k in f for k in (".bak", ".cleared.")) and f not in names:
+                    names.append(f)
+        for f in names:
+            p = f"{DATA}/{f}"
+            if not os.path.exists(p):
+                skipped.append(f)
+                continue
+            data = open(p, "rb").read()
+            if f.endswith((".csv", ".json")) and not data.startswith(b"\xef\xbb\xbf"):
+                data = b"\xef\xbb\xbf" + data   # Excel 直开不乱码
+            zf.writestr(f, data)
+            included.append(f)
+        meta = {
+            "exported_utc": stamp,
+            "files": included,
+            "rounds_total": S.round_n,
+            "rounds_accuracy": round_stats()["acc"],
+            "paper_stats": paper_stats(),
+            "paper_cfg": S.paper_cfg,
+            "columns": {
+                "rounds_v2.csv": "每场预判与结果：start/pred/p_pred/conf/outcome/hit/label/P0/收盘均价/预判时卖价/特征",
+                "outcomes.csv": "每场结算结果(p0/c 自算与官方 TWAP)",
+                "ticks.csv": "场中每 2 秒 tick：p_up/盘口买卖价/P0/特征",
+                "paper_trades.csv": "模拟成交：sig(强/普)/buy_price/amount/shares/btc/p0/btc_diff/pnl",
+                "paper_cfg.json": "模拟下单参数",
+                "calib.json": "Platt 校准参数",
+            },
+        }
+        zf.writestr("meta.json", json.dumps(meta, ensure_ascii=False, indent=2))
+    body = buf.getvalue()
+    name = f"btctest4-data-{stamp}.zip"
+    log.info("导出策略数据 %s: %s (%d 字节)%s", name, ",".join(included), len(body),
+             f"；缺失 {','.join(skipped)}" if skipped else "")
+    return web.Response(body=body, content_type="application/zip",
                         headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
 
@@ -1440,9 +1493,9 @@ $('pager').innerHTML=`<button ${page<=1?'disabled':''} onclick="gotoPage(1)">首
 <button ${page>=tp?'disabled':''} onclick="gotoPage(${page+1})">下一页</button>
 <button ${page>=tp?'disabled':''} onclick="gotoPage(${tp})">末页</button>
 <span class="info">第 ${page}/${tp} 页，每页 ${PAGE_SIZE} 场，共 ${total} 场</span>
-<button onclick="exportRounds()">导出CSV</button>
+<button onclick="exportData()">导出数据包</button>
 <button class="danger" onclick="clearRounds()">清空重置</button>`}
-function exportRounds(){window.open('/api/rounds/export'+Q,'_blank')}
+function exportData(){window.open('/api/data/export'+Q,'_blank')}
 async function clearRounds(){
 if(!confirm('确定清空历史场次？命中率会归零。\n当前 rounds_v2.csv 会归档为 .cleared 备份，不会直接删除。\nticks/outcomes 分析文件保留。')) return;
 try{
@@ -1578,7 +1631,8 @@ async def main(host, port):
                         web.get("/api/paper/cfg", api_paper_cfg),
                         web.post("/api/paper/cfg", api_paper_cfg),
                         web.post("/api/paper/clear", api_paper_clear),
-                        web.get("/api/rounds/export", api_export_rounds)])
+                        web.get("/api/rounds/export", api_export_rounds),
+                        web.get("/api/data/export", api_export_data)])
         runner = web.AppRunner(app, access_log=None)
         await runner.setup()
         await web.TCPSite(runner, host, port).start()
