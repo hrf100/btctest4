@@ -1251,6 +1251,25 @@ async def api_state(req):
                               "paper_stats": paper_stats()})
 
 
+async def api_export_rounds(req):
+    """导出历史场次 CSV（全量，来自 rounds_v2.csv）。"""
+    if not _auth(req):
+        return web.Response(status=401, text="bad token")
+    path = f"{DATA}/rounds_v2.csv"
+    name = f"btctest4-rounds-{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}.csv"
+    if not os.path.exists(path):
+        return web.Response(status=404, text="no rounds data")
+    with open(path, "rb") as fh:
+        body = fh.read()
+    if body.startswith(b"\xef\xbb\xbf"):   # 已有 BOM 就不重复加
+        pass
+    else:
+        body = b"\xef\xbb\xbf" + body      # 加 BOM，Excel 直接打开不乱码
+    log.info("导出历史场次 %s (%d 字节)", name, len(body))
+    return web.Response(body=body, content_type="text/csv", charset="utf-8",
+                        headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
 async def api_clear_rounds(req):
     """清空看板历史场次；CSV 先归档为 .cleared.*.bak，不直接砸掉。"""
     if not _auth(req):
@@ -1421,7 +1440,9 @@ $('pager').innerHTML=`<button ${page<=1?'disabled':''} onclick="gotoPage(1)">首
 <button ${page>=tp?'disabled':''} onclick="gotoPage(${page+1})">下一页</button>
 <button ${page>=tp?'disabled':''} onclick="gotoPage(${tp})">末页</button>
 <span class="info">第 ${page}/${tp} 页，每页 ${PAGE_SIZE} 场，共 ${total} 场</span>
+<button onclick="exportRounds()">导出CSV</button>
 <button class="danger" onclick="clearRounds()">清空重置</button>`}
+function exportRounds(){window.open('/api/rounds/export'+Q,'_blank')}
 async function clearRounds(){
 if(!confirm('确定清空历史场次？命中率会归零。\n当前 rounds_v2.csv 会归档为 .cleared 备份，不会直接删除。\nticks/outcomes 分析文件保留。')) return;
 try{
@@ -1556,7 +1577,8 @@ async def main(host, port):
                         web.post("/api/rounds/clear", api_clear_rounds),
                         web.get("/api/paper/cfg", api_paper_cfg),
                         web.post("/api/paper/cfg", api_paper_cfg),
-                        web.post("/api/paper/clear", api_paper_clear)])
+                        web.post("/api/paper/clear", api_paper_clear),
+                        web.get("/api/rounds/export", api_export_rounds)])
         runner = web.AppRunner(app, access_log=None)
         await runner.setup()
         await web.TCPSite(runner, host, port).start()
