@@ -319,6 +319,29 @@ def paper_page(page=1, size=20):
     return {"page": page, "size": size, "pages": pages, "total": total, "rows": chunk}
 
 
+def paper_curve(max_points=300):
+    """模拟下单累计盈亏曲线：按结算顺序累计，含合计与三档分线。
+
+    返回 [[序号, 合计, 前, 强, 普], ...]，点太多时等距抽样（保留最后一个点）。
+    """
+    xs = [(r.get("sig") or "strong", float(r.get("pnl") or 0))
+          for r in S.paper if int(r.get("settled") or 0) == 1]
+    if not xs:
+        return []
+    cum = {"pre": 0.0, "strong": 0.0, "weak": 0.0}
+    pts = []
+    for i, (sig, pnl) in enumerate(xs, 1):
+        cum[sig] = cum.get(sig, 0.0) + pnl
+        pts.append([i, round(sum(cum.values()), 4),
+                    round(cum["pre"], 4), round(cum["strong"], 4), round(cum["weak"], 4)])
+    if len(pts) > max_points:
+        step = len(pts) / max_points
+        keep = [pts[int(i * step)] for i in range(max_points)]
+        keep[-1] = pts[-1]
+        pts = keep
+    return pts
+
+
 def round_page(page=1, size=20):
     """历史场次分页（最新在前）。只传当前页，避免每秒把几千场全量塞给浏览器。"""
     rows = S.rounds
@@ -1465,7 +1488,7 @@ async def api_state(req):
                               "rounds": round_page(rpage, rsize), "stats": round_stats(), "feeds": feeds,
                               "auth": S.auth, "cl_src": S.cl_src, "host": host_stats(),
                               "paper_cfg": S.paper_cfg, "paper": paper_page(ppage, psize),
-                              "paper_stats": paper_stats()})
+                              "paper_stats": paper_stats(), "paper_curve": paper_curve()})
 
 
 DATA_FILES = ("rounds_v2.csv", "outcomes.csv", "ticks.csv", "paper_trades.csv",
@@ -1654,6 +1677,8 @@ table{border-collapse:collapse;width:100%}td,th{padding:3px 6px;border-bottom:1p
 <div class="tip">三档独立，同一场每档最多一笔。<b>开盘前</b>：预判后到开盘，模型强度 |p−0.5| ≥ 设定值且预判方向卖一 ≤ 卖价上限即按卖一买入（只看模型强度，卖价只防买贵）。<b>强 / 普</b>：开盘后设定秒数内，预判方向卖一 ≤ 买价上限才买。份额 = 金额 / 买价；盈亏：中 +金额×(1/买价−1)，错 −金额；差值 = BTC − 开盘基准价 P0。</div>
 <div class="paper-bar" id="paperBar"></div>
 <div id="paperStats" class="tip"></div>
+<canvas id="c3"></canvas>
+<div class="tip">收益曲线：按结算顺序累计每笔模拟单盈亏（U）。绿线=合计，橙=开盘前，蓝=强信号，紫=普通信号。</div>
 <div id="paperPager" class="pager"></div>
 <div class="wrap" id="paperTbl"></div>
 <h3>历史场次</h3><div id="stats"></div><div id="pager" class="pager"></div><div class="wrap" id="tbl"></div>
@@ -1688,6 +1713,11 @@ g.font='10px monospace';g.lineWidth=1;for(let i=0;i<=4;i++){const y=y0+(y1-y0)*i
 (o.h||[]).forEach(h=>{g.strokeStyle=h.c;g.setLineDash([4,3]);g.beginPath();g.moveTo(44,Y(h.y));g.lineTo(W-8,Y(h.y));g.stroke();g.setLineDash([])});
 lines.forEach(l=>{g.strokeStyle=l.c;g.lineWidth=1.5;g.beginPath();let on=false;l.d.forEach(p=>{if(p[1]==null){on=false;return}const x=X(p[0]),y=Y(p[1]);if(on)g.lineTo(x,y);else{g.moveTo(x,y);on=true}});g.stroke()});
 let lx=48;g.font='11px sans-serif';lines.forEach(l=>{g.fillStyle=l.c;const label=l.v==null?l.n:`${l.n} ${l.v}`;g.fillText(label,lx,9);lx+=g.measureText(label).width+18})}
+// 曲线数据没变时不重绘 canvas（每秒一次全量重绘是纯浪费）
+function plotCached(cv,lines,o={}){const last=l=>l.d.length?l.d[l.d.length-1]:0;
+const sig=JSON.stringify([lines.map(l=>[l.n,l.v,l.d.length,last(l)]),o.h||[],cv.clientWidth]);
+if(cv._sig===sig) return; cv._sig=sig; plot(cv,lines,o)}
+function clearPlot(cv){if(!cv||!cv._sig)return;cv._sig=null;const g=cv.getContext('2d');g.setTransform(1,0,0,1,0,0);g.clearRect(0,0,cv.width,cv.height)}
 function pages(){return Math.max(1, roundsPage.pages||1)}
 function gotoPage(p){page=Math.min(Math.max(1,p), pages()); tick()}
 function renderRounds(){
@@ -1754,10 +1784,6 @@ if(c){h+=card('本场剩余',Math.max(0,c.end-d.now).toFixed(0)+' 秒')
 +card('模型−卖价：涨 / 跌',f(c.edge_up,3)+' / '+f(c.edge_dn,3),'mut','模型概率 减 盘口卖价，仅供参考。回测显示按此差值买入是亏的（差值大通常是盘口对、模型错），不作为买入依据')
 +card('本场预判',c.pred?`${ud(c.pred)} (${f(c.p_pred,3)})`:'无',c.pred=='Up'?'up':(c.pred=='Down'?'dn':''),'开盘前20秒做出的预判')}
 setH('top',h);
-// 曲线数据没变时不重绘 canvas（每秒一次全量重绘是纯浪费）
-function plotCached(cv,lines,o={}){const last=l=>l.d.length?l.d[l.d.length-1]:0;
-const sig=JSON.stringify([lines.map(l=>[l.n,l.v,l.d.length,last(l)]),o.h||[],cv.clientWidth]);
-if(cv._sig===sig) return; cv._sig=sig; plot(cv,lines,o)}
 const bounds=[];for(let t=Math.ceil((d.now-420)/300)*300;t<=d.now;t+=300)bounds.push(t);
 const L=(i,n,col,v)=>({n,c:col,v,d:d.chart.map(r=>[r[0],r[i]])});
 plotCached($('c1'),[L(1,'参考价','#e6edf3',f(d.spot)),L(2,'币安','#58a6ff',f(d.bn,1)),L(3,'欧易','#a371f7',f(d.okx,1)),L(4,'官方60秒均价','#f0883e',f(d.chart&&d.chart.length?d.chart[d.chart.length-1][4]:null))],{v:bounds,h:c?[{y:c.p0,c:'#3fb950'}]:[],dec:0});
@@ -1792,7 +1818,20 @@ const ps=d.paper_stats||{};
 const pct=x=>x==null?'-':(x*100).toFixed(1)+'%';
 const sg=p=>{const s=(ps.by_sig||{})[p]||{};return `${SIGT[p]} ${s.trades||0}笔/${s.settled||0}结算 胜率 ${pct(s.win_rate)} 盈亏 ${s.pnl==null?'-':((s.pnl>=0?'+':'')+Number(s.pnl).toFixed(3))}U`};
 const cp=d.cur&&d.cur.paper;
-setH('paperStats',`合计 ${ps.n||0} 笔｜结算 ${ps.settled||0}｜胜率 ${pct(ps.win_rate)}｜盈亏 ${ps.pnl==null?'-':((ps.pnl>=0?'+':'')+Number(ps.pnl).toFixed(3))} U　｜　${sg('pre')}　｜　${sg('strong')}　｜　${sg('weak')}`+(cp?`　｜　本场最近成交[${SIGT[cp.sig]||cp.sig}]：${ud(cp.side)} @ ${f(cp.buy_price,3)} × ${f(cp.amount,2)}U，相对开盘 ${cp.tau>0?'+':''}${f(cp.tau,0)}s`:''));const pp=d.paper||{rows:[],page:1,pages:1,total:0,size:PAPER_PAGE_SIZE};
+setH('paperStats',`合计 ${ps.n||0} 笔｜结算 ${ps.settled||0}｜胜率 ${pct(ps.win_rate)}｜盈亏 ${ps.pnl==null?'-':((ps.pnl>=0?'+':'')+Number(ps.pnl).toFixed(3))} U　｜　${sg('pre')}　｜　${sg('strong')}　｜　${sg('weak')}`+(cp?`　｜　本场最近成交[${SIGT[cp.sig]||cp.sig}]：${ud(cp.side)} @ ${f(cp.buy_price,3)} × ${f(cp.amount,2)}U，相对开盘 ${cp.tau>0?'+':''}${f(cp.tau,0)}s`:''));
+// 收益曲线：合计 + 三档分线（值域强制包含 0，全亏时也能正常显示）
+const CV=d.paper_curve||[];
+if(CV.length){const lz=CV[CV.length-1];
+const vs=CV.flatMap(r=>[r[1],r[2],r[3],r[4]]);
+const lo=Math.min(0,...vs), hi=Math.max(0,...vs), pad=Math.max(0.5,(hi-lo)*0.08);
+plotCached($('c3'),[
+{n:'合计',v:(lz[1]>=0?'+':'')+f(lz[1],3)+'U',c:'#3fb950',d:CV.map(r=>[r[0],r[1]])},
+{n:'前',v:(lz[2]>=0?'+':'')+f(lz[2],3),c:SIGC.pre,d:CV.map(r=>[r[0],r[2]])},
+{n:'强',v:(lz[3]>=0?'+':'')+f(lz[3],3),c:SIGC.strong,d:CV.map(r=>[r[0],r[3]])},
+{n:'普',v:(lz[4]>=0?'+':'')+f(lz[4],3),c:SIGC.weak,d:CV.map(r=>[r[0],r[4]])}
+],{x0:1,x1:lz[0],y0:lo-pad,y1:hi+pad,h:[{y:0,c:'#555'}],dec:1})}
+else{clearPlot($('c3'))}
+const pp=d.paper||{rows:[],page:1,pages:1,total:0,size:PAPER_PAGE_SIZE};
 let t='<table><tr><th>买入时间(UTC)</th><th>信号</th><th>方向</th><th>买入价</th><th>金额(U)</th><th>份额</th><th>相对开盘(秒)</th><th>BTC</th><th>差值($)</th><th>差值(bps)</th><th>预判概率</th><th>结果</th><th>命中</th><th>盈亏(U)</th></tr>';
 (pp.rows||[]).slice().reverse().forEach(r=>{const hit=r.settled? (r.hit?'✔ 中':'✘ 错'):'待结';
 const hc=r.settled?(r.hit?'up':'dn'):'mut';
