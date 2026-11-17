@@ -68,10 +68,14 @@ SNIPE_DEFAULT = {
     "tp_frac": 0.5,         # 半仓止盈比例
     "per_round": 1,         # 每场最多狙击次数
 }
-SNIPE_FIELDS = ("nid", "start", "time_utc", "side", "entry", "shares", "amount", "tau", "remain",
-                "spot", "strike", "atr", "r_gap", "score", "tir", "bounce",
-                "s_flow", "s_bounce", "s_gap", "tp_target", "tp_hit", "tp_tau", "tp_bid",
-                "tp_shares", "cash1", "stage", "outcome", "hit", "settle_value", "pnl", "settled")
+SNIPE_FIELDS = ("nid", "start", "time_utc", "src", "side", "entry", "shares", "amount",
+                "tau", "remain", "spot", "strike", "atr", "r_gap", "score",
+                "s_time", "tir", "tir30", "bounce", "s_flow", "s_bounce", "s_gap",
+                "tp_target", "tp_hit", "tp_tau", "tp_bid", "tp_shares", "cash1",
+                "stage", "outcome", "hit", "settle_value", "pnl", "settled")
+# 翻转评分四段权重(合计 100)。看板每张卡片底部显示 "得分/满分"，加总即为总分
+SNIPE_W = {"time": 30.0, "flow": 35.0, "bounce": 20.0, "gap": 15.0}
+SNIPE_TIME_FULL = 210.0   # 剩余时间达到此秒数时时间窗满分
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("btc5m")
@@ -447,62 +451,91 @@ def paper_status(s0, now, w, r, spot=None):
             "rows": out}
 
 
-def snipe_status(s0, now, w, r, spot, ref=None):
-    """狙击实时状态：逐项给出"通过/拦截"和原因，看板顶部展示。
-    判定条件与 try_snipe 完全一致。"""
+def snipe_target(now, w, r, spot, ref=None):
+    """雷达锁定：挑出被打到地板的一侧，并给出锁定信息（不判定是否可买）。
+
+    优先在 [min_entry, max_entry] 区间内按更便宜的一侧锁定；若两侧都不在区间内，
+    仍锁定更便宜的一侧用于展示评分与说明，但标记 in_range=False。
+    """
     cfg = S.snipe_cfg or {}
-    tau = now - s0
-    remain = max(0.0, (s0 + WIN) - now)
-    checks = []
-
-    def add(name, ok, detail):
-        checks.append({"name": name, "ok": ok, "detail": detail})
-
-    add("启用", bool(cfg.get("enabled")), "已开启" if cfg.get("enabled") else "已关闭")
-    done = int(w.get("snipe_cnt") or 0)
-    add("本场次数", done < int(cfg.get("per_round") or 1),
-        f"已 {done}/{int(cfg.get('per_round') or 1)}")
-    tmin, tmax = float(cfg.get("tau_min") or 0), float(cfg.get("tau_max") or 0)
-    add("时间窗", tmin <= tau <= tmax,
-        f"相对开盘 {tau:.0f}s（区间 {tmin:.0f}~{tmax:.0f}s，剩余 {remain:.0f}s）")
-
     lo = float(cfg.get("min_entry") or 0.0)
     cap = float(cfg.get("max_entry") or 0.1)
     ub, ua = r.get("up_bid"), r.get("up_ask")
     db, da = r.get("dn_bid"), r.get("dn_ask")
-    cand = []
-    if ua is not None and lo <= ua <= cap:
-        cand.append(("Up", ua))
-    if da is not None and lo <= da <= cap:
-        cand.append(("Down", da))
-    ask_txt = f"涨 {ua if ua is None else f'{ua:.3f}'} / 跌 {da if da is None else f'{da:.3f}'}"
-    add("建仓价", bool(cand), f"{ask_txt}（需 {lo:.3f}~{cap:.3f}）")
-
-    atr = snipe_atr(now)
+    offers = []
+    if ua is not None:
+        offers.append(("Up", ua, ub))
+    if da is not None:
+        offers.append(("Down", da, db))
+    if not offers:
+        return None
+    side, ask, bid = min(offers, key=lambda x: x[1])
+    in_range = lo <= ask <= cap
     strike = r.get("p0")
-    add("ATR/Strike", bool(atr and strike), f"ATR {atr:.2f}$ / Strike {strike:.2f}" if (atr and strike)
-        else "数据不足")
+    atr = snipe_atr(now)
+    remain = max(0.0, (w.get("start", 0) + WIN) - now)
+    score = detail = None
+    if atr and strike and spot is not None:
+        score, detail = snipe_score(now, w, side, spot, strike, atr, remain, ref)
+    return {"side": side, "ask": round(float(ask), 4),
+            "bid": None if bid is None else round(float(bid), 4),
+            "in_range": in_range, "lo": lo, "cap": cap,
+            "strike": None if not strike else round(float(strike), 2),
+            "atr": None if not atr else round(atr, 3),
+            "score": score, "detail": detail or {},
+            "other": {s: (None if a is None else round(float(a), 4)) for s, a, _ in offers}}
+
+
+def snipe_status(s0, now, w, r, spot, ref=None):
+    """狙击实时状态：雷达头部 + 四张评分卡所需数据。判定条件与 try_snipe 完全一致。"""
+    cfg = S.snipe_cfg or {}
+    tau = now - s0
+    remain = max(0.0, (s0 + WIN) - now)
+    tgt = snipe_target(now, w, r, spot, ref)
+    atr = tgt["atr"] if tgt else None
+    strike = tgt["strike"] if tgt else None
     r_gap = None
     if atr and strike and spot is not None:
         r_gap = abs(spot - strike) / (atr * math.sqrt(max(remain, 1) / 60.0))
-        add("R_gap", r_gap <= float(cfg.get("r_gap_max") or 1.65),
-            f"{r_gap:.2f}（上限 {float(cfg.get('r_gap_max') or 1.65):.2f}）")
-    score = None
-    detail = {}
-    if cand and atr and strike:
-        side = min(cand, key=lambda x: x[1])[0]
-        score, detail = snipe_score(now, w, side, spot, strike, atr, remain, ref)
-        add("翻转评分", score >= float(cfg.get("min_score") or 62),
-            f"{score:.1f}（门槛 {float(cfg.get('min_score') or 62):.0f}：流 {detail['s_flow']:.0f} + "
-            f"反弹 {detail['s_bounce']:.0f} + 缓冲 {detail['s_gap']:.0f}）")
-    ready = bool(checks) and all(c["ok"] for c in checks)
+    score = tgt["score"] if tgt else None
+    min_score = float(cfg.get("min_score") or 62)
+    tmin, tmax = float(cfg.get("tau_min") or 0), float(cfg.get("tau_max") or 0)
+    done = int(w.get("snipe_cnt") or 0)
+    per = int(cfg.get("per_round") or 1)
+    checks = [
+        {"name": "启用", "ok": bool(cfg.get("enabled")),
+         "detail": "已开启" if cfg.get("enabled") else "已关闭"},
+        {"name": "本场次数", "ok": done < per, "detail": f"已 {done}/{per}"},
+        {"name": "时间窗", "ok": tmin <= tau <= tmax,
+         "detail": f"相对开盘 {tau:.0f}s（区间 {tmin:.0f}~{tmax:.0f}s，剩余 {remain:.0f}s）"},
+        {"name": "建仓价", "ok": bool(tgt and tgt["in_range"]),
+         "detail": (f"{'涨' if tgt['side'] == 'Up' else '跌'} 卖一 {tgt['ask']:.3f}"
+                    f"（需 {tgt['lo']:.3f}~{tgt['cap']:.3f}）"
+                    if tgt else "盘口无卖价")},
+        {"name": "ATR/Strike", "ok": bool(atr and strike),
+         "detail": f"ATR {atr:.2f}$ / Strike {strike:.2f}" if (atr and strike) else "数据不足"},
+        {"name": "R_gap", "ok": r_gap is not None and r_gap <= float(cfg.get("r_gap_max") or 1.65),
+         "detail": f"{r_gap:.2f}（上限 {float(cfg.get('r_gap_max') or 1.65):.2f}）" if r_gap is not None
+                   else "数据不足"},
+        {"name": "翻转评分", "ok": score is not None and score >= min_score,
+         "detail": f"{score:.1f}（门槛 {min_score:.0f}）" if score is not None else "数据不足"},
+    ]
+    ready = all(c["ok"] for c in checks)
+    blocked = [c["name"] for c in checks if not c["ok"]]
+    # 兜底：数据不足时 detail 里的观测值为 None，前端统一显示为 "-"（避免 NaN% / $-）
+    det = {"s_time": 0.0, "s_flow": 0.0, "s_bounce": 0.0, "s_gap": 0.0,
+           "tir": None, "tir30": None, "bounce": None, "gap": None, "tol": None}
+    det.update((tgt or {}).get("detail") or {})
     return {"round": s0, "tau": round(tau, 1), "remain": round(remain, 1),
             "spot": None if spot is None else round(float(spot), 2),
-            "strike": None if strike is None else round(float(strike), 2),
-            "atr": None if atr is None else round(atr, 3),
-            "r_gap": None if r_gap is None else round(r_gap, 3),
-            "score": score, "detail": detail,
-            "cand": [c[0] for c in cand], "ready": ready, "checks": checks}
+            "target": tgt, "side": tgt["side"] if tgt else None,
+            "ask": tgt["ask"] if tgt else None, "bid": tgt["bid"] if tgt else None,
+            "strike": strike, "atr": atr, "r_gap": None if r_gap is None else round(r_gap, 3),
+            "score": score, "detail": det,
+            "min_score": min_score, "weights": SNIPE_W,
+            "scored": score is not None,
+            "bet": float(cfg.get("bet") or 5.0), "auto": bool(cfg.get("enabled")),
+            "ready": ready, "blocked": blocked, "checks": checks}
 
 
 def round_page(page=1, size=20):
@@ -698,8 +731,8 @@ def save_snipe_cfg(cfg=None):
 
 def _snipe_row_num(r):
     for k in ("entry", "shares", "amount", "tau", "remain", "spot", "strike", "atr", "r_gap",
-              "score", "tir", "bounce", "s_flow", "s_bounce", "s_gap", "tp_target", "tp_tau",
-              "tp_bid", "tp_shares", "cash1", "settle_value", "pnl"):
+              "score", "s_time", "tir", "tir30", "bounce", "s_flow", "s_bounce", "s_gap",
+              "tp_target", "tp_tau", "tp_bid", "tp_shares", "cash1", "settle_value", "pnl"):
         if k in r:
             r[k] = _num(r[k], float)
     for k in ("start", "tp_hit", "hit", "settled"):
@@ -829,32 +862,41 @@ def _round_low_high(w, ref):
 
 
 def snipe_score(now, w, side, spot, strike, atr, remain, ref=None):
-    """翻转评分 0~100：5秒订单流反转(45) + 极值反弹(30) + 预言机缓冲垫(25)。
+    """翻转评分 0~100，四段权重与看板卡片一一对应：
 
-    返回 (总分, 明细dict)。只对"被打到地板"的一侧评分: side 为便宜那一侧(Up/Down),
-    它要翻转获胜, 需要现货朝 strike 反向运动, 所以看"逆向主动流 + 极值反弹"。
+        时间窗 30  +  5秒订单流 35  +  极值反弹 20  +  预言机缓冲 15
+
+    返回 (总分, 明细dict)。detail 里同时给出各段得分(s_*)和原始观测值，
+    看板直接用，保证"卡片显示的分"就是"实际打分"。
     """
-    detail = {"tir": 0.0, "bounce": 0.0, "s_flow": 0.0, "s_bounce": 0.0, "s_gap": 0.0}
+    W = SNIPE_W
+    detail = {"s_time": 0.0, "s_flow": 0.0, "s_bounce": 0.0, "s_gap": 0.0,
+              "tir": None, "tir30": None, "bounce": None, "gap": None, "tol": None}
+    # 1) 时间窗: 剩余时间越充裕越容易完成反转(开盘插针与结尾秒数不足都扣分)
+    detail["s_time"] = round(W["time"] * min(max(remain, 0.0) / 240.0, 1.0), 2)
     if atr is None or atr <= 0:
-        return 0.0, detail
-    # 1) 5 秒主动成交失衡: 便宜侧要翻转获胜, 需要资金反向回流。
+        return round(detail["s_time"], 2), detail
+    # 2) 5 秒主动成交失衡: 便宜侧要翻转获胜, 需要资金反向回流。
     #    Up 被砸到地板 => 需净买入(空头衰竭); Down 被拉爆 => 需净卖出(多头衰竭)。
     r5 = (S.flow["bn"].ratio_since(now, 5) + S.flow["okx"].ratio_since(now, 5)) / 2
+    r30 = (S.flow["bn"].ratio_since(now, 30) + S.flow["okx"].ratio_since(now, 30)) / 2
     tir = r5 if side == "Up" else -r5
     detail["tir"] = round(tir, 4)
-    detail["s_flow"] = round(45 * min(max((tir + 0.1) / 0.6, 0.0), 1.0), 2)
-    # 2) 极值反弹: 从本场极值反抽的美元幅度 / ATR
+    detail["tir30"] = round(r30 if side == "Up" else -r30, 4)
+    detail["s_flow"] = round(W["flow"] * min(max((tir + 0.1) / 0.6, 0.0), 1.0), 2)
+    # 3) 极值反弹: 从本场极值反抽的美元幅度 / ATR
     lo, hi = _round_low_high(w, ref)
     if lo is not None and hi is not None:
         bounce = (spot - lo) if side == "Up" else (hi - spot)
         detail["bounce"] = round(bounce, 2)
-        detail["s_bounce"] = round(30 * min(max(bounce / (atr * 0.6), 0.0), 1.0), 2)
-    # 3) 缓冲垫: 距离 strike 的落差在可追回范围内, 越近分越高
+        detail["s_bounce"] = round(W["bounce"] * min(max(bounce / (atr * 0.6), 0.0), 1.0), 2)
+    # 4) 缓冲垫: 距离 strike 的落差在可追回范围内, 越近分越高
     gap = abs(spot - strike) if strike else 0.0
     tol = atr * math.sqrt(max(remain, 1) / 60.0)
+    detail["gap"], detail["tol"] = round(gap, 2), round(tol, 2)
     if tol > 0:
-        detail["s_gap"] = round(25 * min(max(1.0 - gap / (tol * 1.65), 0.0), 1.0), 2)
-    total = detail["s_flow"] + detail["s_bounce"] + detail["s_gap"]
+        detail["s_gap"] = round(W["gap"] * min(max(1.0 - gap / (tol * 1.65), 0.0), 1.0), 2)
+    total = detail["s_time"] + detail["s_flow"] + detail["s_bounce"] + detail["s_gap"]
     return round(min(total, 100.0), 2), detail
 
 
@@ -869,56 +911,26 @@ def _snipe_save():
     _csv_fields[SNIPE_CSV] = list(SNIPE_FIELDS)
 
 
-def try_snipe(s0, now, w, r, spot, ref=None):
-    """盯盘狙击: 任一侧卖一 <= max_entry 且三维条件达标则建仓(每场 limited 次)。"""
+def _snipe_open(s0, now, w, r, spot, side, ask, atr, strike, r_gap, score, d, src):
+    """建仓落账：自动与手动共用，唯一区别是 src 标记。"""
     cfg = S.snipe_cfg or {}
-    if not cfg.get("enabled") or not w.get("up") or spot is None:
-        return
     tau = now - s0
-    if tau < float(cfg["tau_min"]) or tau > float(cfg["tau_max"]):
-        return
-    done = int(w.get("snipe_cnt") or 0)
-    if done >= int(cfg["per_round"]):
-        return
-    ub, ua = r.get("up_bid"), r.get("up_ask")
-    db, da = r.get("dn_bid"), r.get("dn_ask")
-    cap = float(cfg["max_entry"])
-    lo = float(cfg.get("min_entry") or 0.0)
-    # 找出被打到地板的一侧（卖一 <= 上限）；两侧都便宜时取更便宜的一侧
-    cand = []
-    if ua is not None and lo <= ua <= cap:
-        cand.append(("Up", ua, ub))
-    if da is not None and lo <= da <= cap:
-        cand.append(("Down", da, db))
-    if not cand:
-        return
-    side, ask, _bid = min(cand, key=lambda x: x[1])
-    strike = r.get("p0")
-    if not strike:
-        return
     remain = max(0.0, (s0 + WIN) - now)
-    atr = snipe_atr(now)
-    if not atr:
-        return
-    gap = abs(spot - strike)
-    r_gap = gap / (atr * math.sqrt(max(remain, 1) / 60.0))
-    if r_gap > float(cfg["r_gap_max"]):
-        return
-    score, d = snipe_score(now, w, side, spot, strike, atr, remain, ref)
-    if score < float(cfg["min_score"]):
-        return
     amount = float(cfg["bet"])
     shares = round(amount / float(ask), 6)
     tp_target = round(max(float(ask) * float(cfg["tp_mult"]), float(cfg["tp_min"])), 4)
     row = {
         "nid": f"{s0}-{S.snipe_seq + 1}", "start": s0,
         "time_utc": time.strftime("%m-%d %H:%M:%S", time.gmtime(now)),
+        "src": src,
         "side": side, "entry": round(float(ask), 4), "shares": shares,
         "amount": round(amount, 4), "tau": round(tau, 1), "remain": round(remain, 1),
         "spot": round(float(spot), 2), "strike": round(float(strike), 2),
         "atr": round(float(atr), 3), "r_gap": round(float(r_gap), 3),
-        "score": score, "tir": d["tir"], "bounce": d["bounce"],
-        "s_flow": d["s_flow"], "s_bounce": d["s_bounce"], "s_gap": d["s_gap"],
+        "score": score, "s_time": d.get("s_time", 0.0), "tir": d.get("tir", 0.0),
+        "tir30": d.get("tir30", 0.0), "bounce": d.get("bounce", 0.0),
+        "s_flow": d.get("s_flow", 0.0), "s_bounce": d.get("s_bounce", 0.0),
+        "s_gap": d.get("s_gap", 0.0),
         "tp_target": tp_target, "tp_hit": 0, "tp_tau": "", "tp_bid": "", "tp_shares": 0.0,
         "cash1": 0.0,
         "stage": "HOLDING", "outcome": "", "hit": "", "settle_value": "", "pnl": "",
@@ -932,12 +944,49 @@ def try_snipe(s0, now, w, r, spot, ref=None):
     S.snipe.append(row)
     _add_snipe_stat(row)
     S.snipe_seq += 1
-    w["snipe_cnt"] = done + 1
+    w["snipe_cnt"] = int(w.get("snipe_cnt") or 0) + 1
     w.setdefault("snipe_rows", []).append(row)
-    log.info("狙击建仓 %s side=%s entry=%.3f shares=%.4f 剩余%.0fs 落差%.1f$ R_gap=%.2f ATR=%.2f 评分%.1f "
-             "(流%.1f 反弹%.1f 缓冲%.1f) 止盈线%.3f",
-             s0, side, ask, shares, remain, gap, r_gap, atr, score,
-             d["s_flow"], d["s_bounce"], d["s_gap"], tp_target)
+    log.info("狙击建仓[%s] %s side=%s entry=%.3f shares=%.4f 剩余%.0fs 落差%.1f$ R_gap=%.2f ATR=%.2f "
+             "评分%.1f (时间%.0f 流%.0f 反弹%.0f 缓冲%.0f) 止盈线%.3f",
+             src, s0, side, ask, shares, remain, abs(spot - strike), r_gap, atr, score,
+             d.get("s_time", 0), d.get("s_flow", 0), d.get("s_bounce", 0), d.get("s_gap", 0),
+             tp_target)
+    return row
+
+
+def try_snipe(s0, now, w, r, spot, ref=None):
+    """盯盘狙击: 任一侧卖一在价格区间内且各项条件达标则自动建仓(每场限 per_round 次)。"""
+    cfg = S.snipe_cfg or {}
+    if not cfg.get("enabled") or not w.get("up") or spot is None:
+        return
+    tau = now - s0
+    if tau < float(cfg["tau_min"]) or tau > float(cfg["tau_max"]):
+        return
+    if int(w.get("snipe_cnt") or 0) >= int(cfg["per_round"]):
+        return
+    cap = float(cfg["max_entry"])
+    lo = float(cfg.get("min_entry") or 0.0)
+    # 找出被打到地板的一侧（卖一在区间内）；两侧都便宜时取更便宜的一侧
+    cand = []
+    for side, ask, bid in (("Up", r.get("up_ask"), r.get("up_bid")),
+                           ("Down", r.get("dn_ask"), r.get("dn_bid"))):
+        if ask is not None and lo <= ask <= cap:
+            cand.append((side, ask, bid))
+    if not cand:
+        return
+    side, ask, _bid = min(cand, key=lambda x: x[1])
+    strike = r.get("p0")
+    atr = snipe_atr(now)
+    if not strike or not atr:
+        return
+    remain = max(0.0, (s0 + WIN) - now)
+    r_gap = abs(spot - strike) / (atr * math.sqrt(max(remain, 1) / 60.0))
+    if r_gap > float(cfg["r_gap_max"]):
+        return
+    score, d = snipe_score(now, w, side, spot, strike, atr, remain, ref)
+    if score < float(cfg["min_score"]):
+        return
+    return _snipe_open(s0, now, w, r, spot, side, ask, atr, strike, r_gap, score, d, "auto")
 
 
 def try_snipe_tp(s0, now, r, rows=None):
@@ -2198,6 +2247,47 @@ async def api_snipe_cfg(req):
     return web.json_response({"ok": True, "cfg": c})
 
 
+async def api_snipe_manual(req):
+    """手动以固定金额建仓（对应看板红色按钮）。默认强制三维条件；
+    ?force=1 时忽略条件但仍需价格在区间内，供人工判断使用。"""
+    if not _auth(req):
+        return web.Response(status=401, text="bad token")
+    now = time.time()
+    s0 = int(now // WIN) * WIN
+    w = S.win.get(s0)
+    if not w or not w.get("up"):
+        return web.json_response({"ok": False, "error": "本场盘口还没就绪"}, status=409)
+    r = (S.view or {}).get("cur") or {}
+    if not r.get("p0") or r.get("up_ask") is None:
+        return web.json_response({"ok": False, "error": "本场数据未就绪（缺 Strike 或盘口）"}, status=409)
+    cfg = S.snipe_cfg or {}
+    spot = (S.view or {}).get("spot")
+    ref, _ = get_ref()
+    tgt = snipe_target(now, w, r, spot, ref)
+    if not tgt:
+        return web.json_response({"ok": False, "error": "盘口无卖价"}, status=409)
+    if not tgt["in_range"]:
+        return web.json_response({"ok": False,
+                                  "error": f"卖一 {tgt['ask']:.3f} 不在 "
+                                           f"{tgt['lo']:.3f}~{tgt['cap']:.3f} 区间"}, status=409)
+    if int(w.get("snipe_cnt") or 0) >= int(cfg.get("per_round") or 1):
+        return web.json_response({"ok": False, "error": "本场狙击次数已用满"}, status=409)
+    if not tgt["atr"] or tgt["strike"] is None:
+        return web.json_response({"ok": False, "error": "ATR 或 Strike 数据不足"}, status=409)
+    force = req.query.get("force") in ("1", "true", "yes")
+    st = snipe_status(s0, now, w, r, spot, ref)
+    warn = None
+    if not st["ready"] and not force:
+        return web.json_response({"ok": False, "error": "未达标：" + "、".join(st["blocked"])}, status=409)
+    if not st["ready"]:
+        warn = "手动建仓：当前未达标（" + "、".join(st["blocked"]) + "）"
+    remain = max(0.0, (s0 + WIN) - now)
+    r_gap = abs(spot - tgt["strike"]) / (tgt["atr"] * math.sqrt(max(remain, 1) / 60.0))
+    row = _snipe_open(s0, now, w, r, spot, tgt["side"], tgt["ask"], tgt["atr"],
+                      tgt["strike"], r_gap, tgt["score"] or 0.0, tgt["detail"], "manual")
+    return web.json_response({"ok": True, "row": row, "warn": warn})
+
+
 async def api_snipe_clear(req):
     """清空狙击账本；CSV 归档备份。"""
     if not _auth(req):
@@ -2262,6 +2352,32 @@ table{border-collapse:collapse;width:100%}td,th{padding:3px 6px;border-bottom:1p
 .sstat td,.sstat th{padding:2px 10px 2px 0;font-size:12px;border-bottom:1px solid #1c222b}
 .sstat th{font-weight:400}
 .sstat .ok{color:#3fb950}.sstat .no{color:#f85149}
+/* 狙击雷达：头部一行 + 四张评分卡 */
+.radar{background:linear-gradient(180deg,#131b26,#10151c);border:1px solid #26303d;border-radius:8px;padding:10px 12px;margin:0 0 8px}
+.radar .r1{display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+.radar .lock{font-size:16px;color:#e6edf3;font-weight:600;display:flex;align-items:center;gap:6px}
+.radar .lock .up{color:#3fb950}.radar .lock .dn{color:#f85149}
+.radar .lock .px{font-size:12px;color:#7d8590;font-weight:400}
+.radar .r2{color:#7d8590;font-size:12px;margin-top:2px;font-variant-numeric:tabular-nums}
+.radar .r2 b{color:#9fb0c3;font-weight:400}
+.radar .grow{flex:1}
+.radar .inp{display:flex;flex-direction:column;gap:2px;font-size:11px;color:#7d8590}
+.radar .inp input{width:78px;background:#0b1016;border:1px solid #30363d;border-radius:4px;padding:3px 6px;font-size:13px;font-variant-numeric:tabular-nums}
+.radar .inp.a input{color:#d29922;border-color:#5c4413}
+.radar .inp.b input{color:#a371f7;border-color:#3d2d5c}
+.radar .auto{display:flex;align-items:center;gap:5px;font-size:12px;color:#9fb0c3}
+.radar .go{background:#8b2c31;border:1px solid #b62324;color:#fff;border-radius:6px;padding:8px 16px;font-size:13px;cursor:pointer;font-weight:600;white-space:nowrap}
+.radar .go:hover{background:#a83236}
+.radar .go:disabled{background:#2b1416;border-color:#4a2224;color:#7d8590;cursor:not-allowed}
+.radar .go.armed{background:#b62324;box-shadow:0 0 0 2px rgba(182,35,36,.25)}
+.radar .note{font-size:11px;color:#d29922;margin-top:4px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px;margin:0 0 8px}
+.mcard{background:linear-gradient(180deg,#161d27,#121821);border:1px solid #26303d;border-radius:8px;padding:8px 10px}
+.mcard .t{font-size:11px;color:#7d8590;display:flex;justify-content:space-between;gap:8px}
+.mcard .v{font-size:17px;margin:2px 0 4px;font-variant-numeric:tabular-nums}
+.mcard .bar{height:5px;background:#1d2530;border-radius:3px;overflow:hidden}
+.mcard .bar i{display:block;height:100%;background:linear-gradient(90deg,#d29922,#f0883e);border-radius:3px}
+.mcard .f{font-size:10px;color:#7d8590;margin-top:4px;font-variant-numeric:tabular-nums}
 .topline{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:0 0 8px}
 .topline h2{margin:0}
 .host-meters{display:flex;gap:8px;flex-wrap:wrap}
@@ -2492,11 +2608,10 @@ const cfg=d.snipe_cfg||{};
 const editing=document.activeElement&&document.activeElement.closest&&document.activeElement.closest('#snipeBar');
 if(!editing){
 const I=(id,lab,val,step,min,max,tip='')=>`<label title="${tip}">${lab} <input type="number" id="${id}" step="${step}" min="${min}" max="${max}" value="${val}"></label>`;
-setH('snipeBar',`<label><input type="checkbox" id="sn_en" ${cfg.enabled?'checked':''}> 启用</label>`
-+I('sn_entry','建仓价上限',cfg.max_entry??0.10,0.01,0.01,0.99,'某方向卖一 ≤ 此价才考虑狙击')
-+I('sn_entry_min','下限',cfg.min_entry??0.03,0.005,0.005,0.99,'卖一低于此价说明盘口已基本判定结果，不接飞刀')
+setH('snipeBar',`<label><input type="checkbox" id="sn_en" ${cfg.enabled?'checked':''} onchange="$('sn_auto').checked&&tick()"> 启用</label>`
++I('sn_entry_min','建仓价下限',cfg.min_entry??0.03,0.005,0.005,0.99,'卖一低于此价说明盘口已基本判定结果，不接飞刀')
++`<span class="mut" style="font-size:11px">上限与评分在雷达头部调节</span>`
 +I('sn_bet','单笔(U)',cfg.bet??5,0.5,0.1,10000)
-+I('sn_score','评分≥',cfg.min_score??62,1,0,100,'翻转评分门槛 0~100')
 +I('sn_tmin','起(秒)',cfg.tau_min??60,5,0,300,'相对开盘秒下限（= 剩余时间上限）')
 +I('sn_tmax','止(秒)',cfg.tau_max??230,5,0,300,'相对开盘秒上限（= 剩余时间下限）')
 +I('sn_rgap','R_gap≤',cfg.r_gap_max??1.65,0.05,0.2,10,'ATR 标准化落差上限')
@@ -2538,7 +2653,7 @@ function gotoSnipe(p){snipePage=Math.max(1,p||1);tick()}
 function snipeHintShow(msg,col){const e=$('snipeHint'); if(e){e.textContent=msg; e.style.color=col||'#7d8590'}}
 async function saveSnipe(){
 const g=id=>Number($(id).value);
-const body={enabled:$('sn_en').checked,max_entry:g('sn_entry'),min_entry:g('sn_entry_min'),bet:g('sn_bet'),min_score:g('sn_score'),
+const body={enabled:$('sn_en').checked,min_entry:g('sn_entry_min'),bet:g('sn_bet'),
 tau_min:g('sn_tmin'),tau_max:g('sn_tmax'),r_gap_max:g('sn_rgap'),tp_mult:g('sn_mult'),
 tp_min:g('sn_tpmin'),tp_frac:g('sn_frac'),per_round:g('sn_per')};
 try{const r=await fetch('/api/snipe/cfg'+Q,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -2598,23 +2713,63 @@ setH('paperState',`<div class="sstat">${hd}<table>
 <tr><th>档</th><th>状态</th><th>说明</th><th>方向</th><th>当前卖一</th><th>上限</th></tr>${rows}</table></div>`)}
 
 function renderSnipeState(d){
-const s=d.snipe_status;
+const s=d.snipe_status, cfg=d.snipe_cfg||{};
 if(!s){setH('snipeState','');return}
-const ng=s.checks.filter(c=>!c.ok);
-const hd=`<div class="hd"><b>狙击状态</b>${stPill(s.ready?'ready':'stop')}
-<span class="pill ${s.ready?'ready':'stop'}">${s.ready?'条件全部满足，可以建仓':'未满足：'+(ng.length?ng.map(c=>c.name).join('、'):'等待数据')}</span>
-<div class="kv"><span>相对开盘 <b>${s.tau>0?'+':''}${f(s.tau,0)}s</b></span>
-<span>剩余 <b>${f(s.remain,0)}s</b></span>
-<span>现货 <b>${f(s.spot)}</b></span>
-<span>Strike <b>${f(s.strike)}</b></span>
-<span>ATR <b>${s.atr==null?'-':f(s.atr,2)+'$'}</b></span>
-<span>R_gap <b>${f(s.r_gap,2)}</b></span>
-<span>评分 <b class="${s.score!=null&&s.score>=((d.snipe_cfg||{}).min_score??62)?'up':'warn'}">${s.score==null?'-':f(s.score,1)}</b></span>
-<span>候选 <b>${s.cand.length?s.cand.map(ud).join('/'):'-'}</b></span></div></div>`;
-const rows=s.checks.map(c=>`<tr><td class="${c.ok?'ok':'no'}">${c.ok?'✔':'✘'}</td><td>${c.name}</td><td class="mut">${c.detail}</td></tr>`).join('');
-setH('snipeState',`<div class="sstat">${hd}<table>${rows}</table></div>`)}
+const t=s.target, det=s.detail||{}, W=s.weights||{time:30,flow:35,bounce:20,gap:15};
+const bet=cfg.bet??5, ms=cfg.min_score??62;
+const cU=x=>x==null?'-':(x>=0.1?Math.round(x*100):(x*100).toFixed(1));
+const sideTxt=t?(t.side=='Up'?'UP':'DOWN'):'-';
+const sideCls=t?(t.side=='Up'?'up':'dn'):'';
+const askC=t&&t.ask!=null?cU(t.ask):null, bidC=t&&t.bid!=null?cU(t.bid):null;
+const lock=t?`雷达锁定劣势方：<span class="${sideCls}">${sideTxt}</span> <span class="px">(卖一 ${askC}¢ / 买一 ${bidC==null?'-':bidC+'¢'})</span>`
+:`雷达待命：暂无可锁定方向`;
+const sub=t?`5s 订单流反转：${det.tir==null?'-':(det.tir*100).toFixed(0)+'%'} · 30s 均值：${det.tir30==null?'-':(det.tir30*100).toFixed(1)+'%'} · 极值收回：${det.bounce==null?'-':'$'+f(det.bounce,2)} · 标准化差值 R：${s.r_gap==null?'-':f(s.r_gap,2)} · 剩余 ${f(s.remain,0)}s`
+:`相对开盘 ${f(s.tau,0)}s，剩余 ${f(s.remain,0)}s，等待盘口数据`;
+const canBuy=s.ready;
+const armTxt=t&&askC!=null&&t.ask>0?`以 $${f(bet,2)} 模拟买入 ${sideTxt} (${askC}¢)`:`暂不可买入`;
+setH('snipeState',`<div class="radar">
+<div class="r1">
+<div><div class="lock">${lock}</div><div class="r2">${sub}</div></div>
+<div class="grow"></div>
+<label class="inp a">触发上限(¢)<input type="number" id="sn_entry_c" step="1" min="1" max="99" value="${Math.round((cfg.max_entry??0.1)*100)}" onchange="quickSnipeCfg()"></label>
+<label class="inp b">最低翻转分<input type="number" id="sn_score_q" step="1" min="0" max="100" value="${Math.round(ms)}" onchange="quickSnipeCfg()"></label>
+<label class="auto"><input type="checkbox" id="sn_auto" ${cfg.enabled?'checked':''} onchange="quickSnipeCfg()"> 达标自动 $${f(bet,0)} 狙击</label>
+<button class="go ${canBuy?'armed':''}" ${canBuy?'':'disabled'} onclick="manualSnipe()" title="${canBuy?'条件全部满足，可直接建仓':'未达标；如需忽略条件，请在下方配置栏放宽阈值'}">${armTxt}</button>
+</div>
+${s.blocked&&s.blocked.length?`<div class="note">未达标：${s.blocked.join('、')}${t&&!t.in_range?`（当前 ${askC}¢ 不在 ${Math.round((cfg.min_entry??0.03)*100)}~${Math.round((cfg.max_entry??0.1)*100)}¢ 区间）`:''}</div>`
+:`<div class="note" style="color:#3fb950">条件全部满足，可执行</div>`}
+</div>
+<div class="cards">
+<div class="mcard"><div class="t"><span>综合翻转几率评分</span><span>${s.score==null?'-':f(s.score,0)} / 100</span></div>
+<div class="bar"><i style="width:${Math.max(0,Math.min(100,s.score||0))}%"></i></div>
+<div class="f">时间窗口分 ${f(det.s_time,0)}/${W.time} · 阈值 ≥ ${f(ms,0)}${s.score!=null&&s.score>=ms?' <span class="up">已达标</span>':''}</div></div>
+<div class="mcard"><div class="t"><span>5秒订单流脉冲 (TIR_5s)</span></div>
+<div class="v" style="color:${det.tir==null?'#7d8590':(det.tir>=0?'#58a6ff':'#f85149')}">${det.tir==null?'-':((det.tir*100).toFixed(1)+'%')}</div>
+<div class="f">30s 均值：${det.tir30==null?'-':(det.tir30*100).toFixed(1)+'%'} · 得分 ${f(det.s_flow,0)}/${W.flow}</div></div>
+<div class="mcard"><div class="t"><span>本盘极值 Pin-bar 反弹幅度</span></div>
+<div class="v" style="color:${det.bounce==null?'#7d8590':(det.bounce>0?'#3fb950':'#7d8590')}">${det.bounce==null?'-':(det.bounce>=0?'+':'')+'$'+f(det.bounce,2)+' USD'}</div>
+<div class="f">插针收回得分：${f(det.s_bounce,0)}/${W.bounce}</div></div>
+<div class="mcard"><div class="t"><span>Chainlink 预言机缓冲垫优势</span></div>
+<div class="v" style="color:#d29922">${!s.scored||s.strike==null||s.spot==null?'-':(s.spot>=s.strike?'+':'-')+'$'+f(Math.abs(s.spot-s.strike),2)+' USD'}</div>
+<div class="f">滞后缓冲得分：${f(det.s_gap,0)}/${W.gap}${det.tol==null?'':' · 容差 ±'+f(det.tol,1)+'$'}</div></div>
+</div>`)}
+async function quickSnipeCfg(){
+const body={max_entry:Number($('sn_entry_c').value)/100,min_score:Number($('sn_score_q').value),enabled:$('sn_auto').checked};
+try{const r=await fetch('/api/snipe/cfg'+Q,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+const j=await r.json();
+if(!r.ok||!j.ok){alert(j.error||('保存失败 '+r.status));return}
+tick()}catch(e){alert('保存失败: '+e)}}
+async function manualSnipe(){
+try{const r=await fetch('/api/snipe/manual'+Q,{method:'POST'});
+const j=await r.json();
+if(!r.ok||!j.ok){alert(j.error||('建仓失败 '+r.status));return}
+if(j.warn&&!confirm(j.warn+'\n\n仍要建仓？')) return;
+tick()}catch(e){alert('建仓失败: '+e)}}
 
-async function tick(){try{const sep=Q?Q+'&':'?';const r=await fetch('/api/state'+Q+sep+'ppage='+paperPage+'&psize='+PAPER_PAGE_SIZE+'&rpage='+page+'&rsize='+PAGE_SIZE+'&spage='+snipePage+'&ssize='+SNIPE_PAGE_SIZE);if(!r.ok){$('feeds').textContent=r.status==401?'访问口令错误：请在网址后加 ?token=你的口令（在服务器执行 btc5m url 查看）':'请求失败 HTTP '+r.status;return}draw(await r.json())}catch(e){$('feeds').textContent='无法连接服务器，稍后自动重试…'}}
+async function tick(){try{const sep=Q?Q+'&':'?';const r=await fetch('/api/state'+Q+sep+'ppage='+paperPage+'&psize='+PAPER_PAGE_SIZE+'&rpage='+page+'&rsize='+PAGE_SIZE+'&spage='+snipePage+'&ssize='+SNIPE_PAGE_SIZE);if(!r.ok){$('feeds').textContent=r.status==401?'访问口令错误：请在网址后加 ?token=你的口令（在服务器执行 btc5m url 查看）':'请求失败 HTTP '+r.status;return}
+const j=await r.json();
+try{draw(j)}catch(e){$('feeds').textContent='页面渲染出错（数据已收到）：'+e.message;console.error(e)}}
+catch(e){$('feeds').textContent='无法连接服务器，稍后自动重试…'}}
 tick();setInterval(tick,1000);
 </script></body></html>'''
 
@@ -2636,6 +2791,7 @@ async def main(host, port):
                         web.get("/api/snipe/cfg", api_snipe_cfg),
                         web.post("/api/snipe/cfg", api_snipe_cfg),
                         web.post("/api/snipe/clear", api_snipe_clear),
+                        web.post("/api/snipe/manual", api_snipe_manual),
                         web.get("/api/rounds/export", api_export_rounds),
                         web.get("/api/data/export", api_export_data)])
         runner = web.AppRunner(app, access_log=None)
