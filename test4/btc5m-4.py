@@ -384,6 +384,127 @@ def paper_curve(max_points=300):
     return pts
 
 
+def paper_status(s0, now, w, r, spot=None):
+    """三档实时状态，供看板顶部展示。判定顺序与 try_paper_pre / try_paper_fill 完全一致，
+    保证"显示可买"和"真的会买"不错位。"""
+    done = _paper_done(w)
+    tau = now - s0
+    pred = w.get("pred")
+    strength = abs(float(w.get("p_pred") or 0.5) - 0.5)
+    sel = ("strong" if w.get("conf") else "weak") if pred else None
+    ask = bid = None
+    if pred:
+        if pred == "Up":
+            bid, ask = r.get("up_bid"), r.get("up_ask")
+        else:
+            bid, ask = r.get("dn_bid"), r.get("dn_ask")
+    out = []
+    for prof in ("pre", "strong", "weak"):
+        cfg = (S.paper_cfg or {}).get(prof) or {}
+        cap = float(cfg.get("buy_price") or 0)
+        st = {"prof": prof, "enabled": bool(cfg.get("enabled")), "done": prof in done,
+              "side": pred, "ask": ask, "cap": cap, "tau": round(tau, 1),
+              "state": "", "reason": "", "ready": False}
+        if prof in done:
+            st["state"], st["reason"] = "done", "本场已成交"
+        elif not cfg.get("enabled"):
+            st["state"], st["reason"] = "off", "未启用"
+        elif prof == "pre":
+            if now >= s0:
+                st["state"], st["reason"] = "past", "已过开盘"
+            elif not pred:
+                st["state"], st["reason"] = "wait", "等待预判"
+            elif strength < float(cfg.get("min_strength") or 0):
+                st["state"] = "weak"
+                st["reason"] = f"强度 {strength:.3f} < {float(cfg['min_strength']):.3f}"
+            elif ask is None:
+                st["state"], st["reason"] = "nodata", "盘口无卖价"
+            elif ask > cap:
+                st["state"], st["reason"] = "price", f"卖一 {ask:.2f} > 上限 {cap:.2f}"
+            else:
+                st["state"], st["reason"], st["ready"] = "ready", "可买入", True
+        else:
+            if prof != sel:
+                st["state"] = "skip"
+                st["reason"] = f"本场属{'强' if sel == 'strong' else '普'}信号"
+            elif not pred:
+                st["state"], st["reason"] = "wait", "等待预判"
+            elif tau < 0:
+                st["state"], st["reason"] = "wait", "未开盘"
+            elif tau > float(cfg.get("max_tau") or 0):
+                st["state"] = "past"
+                st["reason"] = f"已过 {int(cfg.get('max_tau') or 0)}s 窗口"
+            elif ask is None:
+                st["state"], st["reason"] = "nodata", "盘口无卖价"
+            elif ask > cap:
+                st["state"], st["reason"] = "price", f"卖一 {ask:.2f} > 上限 {cap:.2f}"
+            else:
+                st["state"], st["reason"], st["ready"] = "ready", "可买入", True
+        out.append(st)
+    return {"round": s0, "tau": round(tau, 1), "remain": round(max(0.0, (s0 + WIN) - now), 1),
+            "pred": pred, "p_pred": round(float(w.get("p_pred") or 0), 4),
+            "strength": round(strength, 4), "sig": sel,
+            "rows": out}
+
+
+def snipe_status(s0, now, w, r, spot, ref=None):
+    """狙击实时状态：逐项给出"通过/拦截"和原因，看板顶部展示。
+    判定条件与 try_snipe 完全一致。"""
+    cfg = S.snipe_cfg or {}
+    tau = now - s0
+    remain = max(0.0, (s0 + WIN) - now)
+    checks = []
+
+    def add(name, ok, detail):
+        checks.append({"name": name, "ok": ok, "detail": detail})
+
+    add("启用", bool(cfg.get("enabled")), "已开启" if cfg.get("enabled") else "已关闭")
+    done = int(w.get("snipe_cnt") or 0)
+    add("本场次数", done < int(cfg.get("per_round") or 1),
+        f"已 {done}/{int(cfg.get('per_round') or 1)}")
+    tmin, tmax = float(cfg.get("tau_min") or 0), float(cfg.get("tau_max") or 0)
+    add("时间窗", tmin <= tau <= tmax,
+        f"相对开盘 {tau:.0f}s（区间 {tmin:.0f}~{tmax:.0f}s，剩余 {remain:.0f}s）")
+
+    lo = float(cfg.get("min_entry") or 0.0)
+    cap = float(cfg.get("max_entry") or 0.1)
+    ub, ua = r.get("up_bid"), r.get("up_ask")
+    db, da = r.get("dn_bid"), r.get("dn_ask")
+    cand = []
+    if ua is not None and lo <= ua <= cap:
+        cand.append(("Up", ua))
+    if da is not None and lo <= da <= cap:
+        cand.append(("Down", da))
+    ask_txt = f"涨 {ua if ua is None else f'{ua:.3f}'} / 跌 {da if da is None else f'{da:.3f}'}"
+    add("建仓价", bool(cand), f"{ask_txt}（需 {lo:.3f}~{cap:.3f}）")
+
+    atr = snipe_atr(now)
+    strike = r.get("p0")
+    add("ATR/Strike", bool(atr and strike), f"ATR {atr:.2f}$ / Strike {strike:.2f}" if (atr and strike)
+        else "数据不足")
+    r_gap = None
+    if atr and strike and spot is not None:
+        r_gap = abs(spot - strike) / (atr * math.sqrt(max(remain, 1) / 60.0))
+        add("R_gap", r_gap <= float(cfg.get("r_gap_max") or 1.65),
+            f"{r_gap:.2f}（上限 {float(cfg.get('r_gap_max') or 1.65):.2f}）")
+    score = None
+    detail = {}
+    if cand and atr and strike:
+        side = min(cand, key=lambda x: x[1])[0]
+        score, detail = snipe_score(now, w, side, spot, strike, atr, remain, ref)
+        add("翻转评分", score >= float(cfg.get("min_score") or 62),
+            f"{score:.1f}（门槛 {float(cfg.get('min_score') or 62):.0f}：流 {detail['s_flow']:.0f} + "
+            f"反弹 {detail['s_bounce']:.0f} + 缓冲 {detail['s_gap']:.0f}）")
+    ready = bool(checks) and all(c["ok"] for c in checks)
+    return {"round": s0, "tau": round(tau, 1), "remain": round(remain, 1),
+            "spot": None if spot is None else round(float(spot), 2),
+            "strike": None if strike is None else round(float(strike), 2),
+            "atr": None if atr is None else round(atr, 3),
+            "r_gap": None if r_gap is None else round(r_gap, 3),
+            "score": score, "detail": detail,
+            "cand": [c[0] for c in cand], "ready": ready, "checks": checks}
+
+
 def round_page(page=1, size=20):
     """历史场次分页（最新在前）。只传当前页，避免每秒把几千场全量塞给浏览器。"""
     rows = S.rounds
@@ -1728,6 +1849,8 @@ async def ticker(sess):
                     try_snipe_tp(s0, now, r, cur.get("snipe_rows"))
                     if cur.get("paper_trade"):
                         r["paper"] = cur["paper_trade"]
+                    v["paper_status"] = paper_status(s0, now, cur, r, ref.last())
+                    v["snipe_status"] = snipe_status(s0, now, cur, r, ref.last(), ref)
                     v["cur"] = r
                     cur["ticks"].append([round(now - s0, 1), round(r["p"], 4), ub, ua, db, da])
                     if now - S.ticks_t >= 2:
@@ -2125,6 +2248,20 @@ table{border-collapse:collapse;width:100%}td,th{padding:3px 6px;border-bottom:1p
 .tabs button:hover{color:#58a6ff}
 .tabs button.on{background:#161b22;border-color:#232a34;color:#e6edf3;position:relative;top:1px}
 .tabs .cnt{color:#7d8590;font-size:11px;margin-left:4px}
+.sstat{background:#161b22;border:1px solid #232a34;border-radius:6px;padding:8px 10px;margin:0 0 8px}
+.sstat .hd{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:6px}
+.sstat .hd b{font-size:13px}
+.sstat .pill{border-radius:10px;padding:1px 9px;font-size:11px;border:1px solid #30363d;color:#7d8590}
+.sstat .pill.ready{background:#0d2f1a;border-color:#2ea043;color:#3fb950}
+.sstat .pill.wait{background:#2b2410;border-color:#9e6a03;color:#d29922}
+.sstat .pill.stop{background:#2b1416;border-color:#8b2c31;color:#f85149}
+.sstat .pill.off{opacity:.6}
+.sstat .kv{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:#7d8590;font-variant-numeric:tabular-nums}
+.sstat .kv b{color:#d6dbe3;font-weight:400}
+.sstat table{margin-top:4px;width:auto;min-width:60%}
+.sstat td,.sstat th{padding:2px 10px 2px 0;font-size:12px;border-bottom:1px solid #1c222b}
+.sstat th{font-weight:400}
+.sstat .ok{color:#3fb950}.sstat .no{color:#f85149}
 .topline{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:0 0 8px}
 .topline h2{margin:0}
 .host-meters{display:flex;gap:8px;flex-wrap:wrap}
@@ -2147,6 +2284,7 @@ table{border-collapse:collapse;width:100%}td,th{padding:3px 6px;border-bottom:1p
 <h3>模拟下单</h3>
 <div class="tabs" id="paperTabs"></div>
 <div id="tabPred">
+<div id="paperState"></div>
 <div class="tip">三档独立，同一场每档最多一笔。<b>开盘前</b>：预判后到开盘，模型强度 |p−0.5| ≥ 设定值且预判方向卖一 ≤ 卖价上限即按卖一买入（只看模型强度，卖价只防买贵）。<b>强 / 普</b>：开盘后设定秒数内，预判方向卖一 ≤ 买价上限才买。份额 = 金额 / 买价；盈亏：中 +金额×(1/买价−1)，错 −金额；差值 = BTC − 开盘基准价 P0。</div>
 <div class="paper-bar" id="paperBar"></div>
 <div id="paperStats" class="tip"></div>
@@ -2156,6 +2294,7 @@ table{border-collapse:collapse;width:100%}td,th{padding:3px 6px;border-bottom:1p
 <div class="wrap" id="paperTbl"></div>
 </div>
 <div id="tabSnipe" style="display:none">
+<div id="snipeState"></div>
 <div class="tip"><b>≤10¢ 绝地反转狙击</b>（独立账本，与上面三档分开统计）。某方向被砸到建仓价上限以下，且同时满足：<b>时间窗</b>、<b>ATR 标准化落差</b> R_gap ≤ 上限、<b>翻转评分</b> ≥ 门槛（5 秒订单流反转 + 极值反弹 + 预言机缓冲垫）时按卖一建仓。<b>两段式止盈</b>：买一达到建仓价的倍数且不低于止盈最低价时，卖出设定比例抽回本金（Free-Roll），余仓持有到结算，正确按 1U 兑付。</div>
 <div class="paper-bar" id="snipeBar"></div>
 <div id="snipeStats" class="tip"></div>
@@ -2282,7 +2421,9 @@ setH('stats',`共 ${st.n||0} 场，命中率 ${st.acc==null?'-':(st.acc*100).toF
 roundsPage=d.rounds||roundsPage; page=roundsPage.page||page;
 renderRounds();
 renderPaper(d);
-renderSnipe(d)}
+renderSnipe(d);
+renderPaperState(d);
+renderSnipeState(d)}
 function renderPaper(d){
 const cfg=d.paper_cfg||{};
 const editing=document.activeElement&&document.activeElement.closest&&document.activeElement.closest('#paperBar');
@@ -2433,6 +2574,46 @@ const j=await r.json();
 if(!r.ok||!j.ok){showHint(j.error||('保存失败 '+r.status),'#f85149');return}
 showHint('已保存','#3fb950');tick()}
 catch(e){showHint('保存失败: '+e,'#f85149')}}
+// ---------------------------------------------------------------- 策略状态（各自 tab 顶部）
+const ST_LABEL={ready:['可执行','ready'],wait:['等待','wait'],off:['未启用','off'],stop:['拦截','stop'],
+done:['已成交','ready'],past:['已过期','off'],weak:['未达标','wait'],price:['价格不满足','wait'],
+nodata:['缺数据','wait'],skip:['本场不适用','off']};
+function stPill(state){const x=ST_LABEL[state]||[state,''];return `<span class="pill ${x[1]}">${x[0]}</span>`}
+function renderPaperState(d){
+const s=d.paper_status;
+if(!s){setH('paperState','');return}
+const ready=s.rows.filter(r=>r.ready).map(r=>SIGT[r.prof]).join('/');
+const hd=`<div class="hd"><b>本场策略状态</b>${stPill(ready?'ready':(s.rows.some(r=>r.state=='wait')?'wait':'off'))}
+<span class="pill">${ready?'可执行档：'+ready:'当前无可执行档'}</span>
+<div class="kv"><span>场次 <b>${hm(s.round)}</b></span>
+<span>相对开盘 <b>${s.tau>0?'+':''}${f(s.tau,0)}s</b></span>
+<span>剩余 <b>${f(s.remain,0)}s</b></span>
+<span>预判 <b class="${s.pred=='Up'?'up':(s.pred=='Down'?'dn':'')}">${ud(s.pred)}</b></span>
+<span>p(涨) <b>${f(s.p_pred,3)}</b></span>
+<span>强度 <b>${f(s.strength,3)}</b></span>
+<span>档位 <b>${s.sig?SIGN[s.sig].replace('·开盘后',''):'-'}</b></span></div></div>`;
+const rows=s.rows.map(r=>`<tr><td style="color:${SIGC[r.prof]}">${SIGT[r.prof]}</td><td>${stPill(r.state)}</td>
+<td class="mut">${r.reason}</td><td>${r.side?ud(r.side):'-'}</td><td>${f(r.ask,3)}</td><td>${f(r.cap,2)}</td></tr>`).join('');
+setH('paperState',`<div class="sstat">${hd}<table>
+<tr><th>档</th><th>状态</th><th>说明</th><th>方向</th><th>当前卖一</th><th>上限</th></tr>${rows}</table></div>`)}
+
+function renderSnipeState(d){
+const s=d.snipe_status;
+if(!s){setH('snipeState','');return}
+const ng=s.checks.filter(c=>!c.ok);
+const hd=`<div class="hd"><b>狙击状态</b>${stPill(s.ready?'ready':'stop')}
+<span class="pill ${s.ready?'ready':'stop'}">${s.ready?'条件全部满足，可以建仓':'未满足：'+(ng.length?ng.map(c=>c.name).join('、'):'等待数据')}</span>
+<div class="kv"><span>相对开盘 <b>${s.tau>0?'+':''}${f(s.tau,0)}s</b></span>
+<span>剩余 <b>${f(s.remain,0)}s</b></span>
+<span>现货 <b>${f(s.spot)}</b></span>
+<span>Strike <b>${f(s.strike)}</b></span>
+<span>ATR <b>${s.atr==null?'-':f(s.atr,2)+'$'}</b></span>
+<span>R_gap <b>${f(s.r_gap,2)}</b></span>
+<span>评分 <b class="${s.score!=null&&s.score>=((d.snipe_cfg||{}).min_score??62)?'up':'warn'}">${s.score==null?'-':f(s.score,1)}</b></span>
+<span>候选 <b>${s.cand.length?s.cand.map(ud).join('/'):'-'}</b></span></div></div>`;
+const rows=s.checks.map(c=>`<tr><td class="${c.ok?'ok':'no'}">${c.ok?'✔':'✘'}</td><td>${c.name}</td><td class="mut">${c.detail}</td></tr>`).join('');
+setH('snipeState',`<div class="sstat">${hd}<table>${rows}</table></div>`)}
+
 async function tick(){try{const sep=Q?Q+'&':'?';const r=await fetch('/api/state'+Q+sep+'ppage='+paperPage+'&psize='+PAPER_PAGE_SIZE+'&rpage='+page+'&rsize='+PAGE_SIZE+'&spage='+snipePage+'&ssize='+SNIPE_PAGE_SIZE);if(!r.ok){$('feeds').textContent=r.status==401?'访问口令错误：请在网址后加 ?token=你的口令（在服务器执行 btc5m url 查看）':'请求失败 HTTP '+r.status;return}draw(await r.json())}catch(e){$('feeds').textContent='无法连接服务器，稍后自动重试…'}}
 tick();setInterval(tick,1000);
 </script></body></html>'''
